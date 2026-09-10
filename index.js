@@ -770,6 +770,7 @@ async function runJobsLoop(chatId) {
     const clientId = await getClientIdForChat(chatId);
     const applyProfile = clientId ? await loadApplyProfile(supabase, clientId) : {};
 
+    console.log(`[User ${chatId}] Processing ${jobs.length} jobs. Profile AWL ID: '${applyProfile.applywizz_id}'`);
     for (const job of jobs) {
       const { url } = job;
       if (!state.jobRunnerActive || state.runGeneration !== runGeneration) {
@@ -778,6 +779,7 @@ async function runJobsLoop(chatId) {
       }
 
       if (await hasHandledJob(chatId, url)) {
+        console.log(`[User ${chatId}] Skipping ${url}: Already handled (in applications or queue).`);
         continue;
       }
 
@@ -805,6 +807,7 @@ async function runJobsLoop(chatId) {
       }
 
       if (String(job.applywizzId || '') !== String(applyProfile.applywizz_id || '')) {
+        console.log(`[User ${chatId}] Skipping ${url}: applywizz_id mismatch. Job: '${job.applywizzId}', Profile: '${applyProfile.applywizz_id}'`);
         continue;
       }
 
