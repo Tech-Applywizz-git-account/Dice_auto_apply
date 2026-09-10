@@ -3,7 +3,7 @@ require('dotenv').config();
 const crypto = require('crypto');
 const { Bot } = require('node-telegram-bot-api');
 const sgMail = require('@sendgrid/mail');
-const { createPool, createServiceClient } = require('./lib/supabase');
+const { createPool, createServiceClient } = require('./lib/azure');
 const { createDashboardServer } = require('./lib/dashboard-server');
 const { fillCurrentStep, isVisibleEnabled, loadApplyProfile } = require('./lib/dice-apply-questions');
 const { openBrowser, closeBrowser, useBrowserbase, maxConcurrent } = require('./lib/browser');
@@ -24,10 +24,10 @@ if (!dicePassword) {
   throw new Error('DICE_PASSWORD must be set in the environment.');
 }
 
-const supabase = createServiceClient();
+const azure = createServiceClient();
 const dashboardServer = createDashboardServer({ db: createPool() });
-const applyQueue = createApplyQueue(supabase);
-const workflowStateStore = createWorkflowStateStore(supabase);
+const applyQueue = createApplyQueue(azure);
+const workflowStateStore = createWorkflowStateStore(azure);
 let applyWorkerController = null;
 
 sgMail.setApiKey(sendGridApiKey);
@@ -186,7 +186,7 @@ function hashOtp(code) {
 }
 
 async function saveOTP(chatId, email, otp) {
-  const { error } = await supabase.from('otp_challenges').upsert({
+  const { error } = await azure.from('dice_telegram_otps').upsert({
     telegram_chat_id: chatId,
     email,
     code_hash: hashOtp(otp),
@@ -197,8 +197,8 @@ async function saveOTP(chatId, email, otp) {
 }
 
 async function verifyOTP(chatId, enteredCode) {
-  const { data, error } = await supabase
-    .from('otp_challenges')
+  const { data, error } = await azure
+    .from('dice_telegram_otps')
     .select('code_hash, expires_at')
     .eq('telegram_chat_id', chatId)
     .maybeSingle();
@@ -214,7 +214,7 @@ async function verifyOTP(chatId, enteredCode) {
 }
 
 async function deleteOTP(chatId) {
-  const { error } = await supabase.from('otp_challenges').delete().eq('telegram_chat_id', chatId);
+  const { error } = await azure.from('dice_telegram_otps').delete().eq('telegram_chat_id', chatId);
   if (error) console.error(`[User ${chatId}] Failed to delete OTP:`, error.message);
 }
 
@@ -242,8 +242,8 @@ async function sendOTPEmail(email, otp, chatId = null) {
 
 // === USER MATCHING HELPERS ===
 async function findUserByEmail(companyEmail) {
-  const { data, error } = await supabase
-    .from('clients')
+  const { data, error } = await azure
+    .from('clients_additional_info')
     .select('id, applywizz_id, company_email, full_name')
     .eq('company_email', companyEmail.trim())
     .maybeSingle();
@@ -257,7 +257,7 @@ async function findUserByEmail(companyEmail) {
 }
 
 async function linkTelegramChat(chatId, clientId) {
-  const { error } = await supabase.from('telegram_links').upsert(
+  const { error } = await azure.from('dice_telegram_connection').upsert(
     {
       telegram_chat_id: chatId,
       client_id: clientId,
@@ -272,8 +272,8 @@ async function linkTelegramChat(chatId, clientId) {
 }
 
 async function getClientIdForChat(chatId) {
-  const { data, error } = await supabase
-    .from('telegram_links')
+  const { data, error } = await azure
+    .from('dice_telegram_connection')
     .select('client_id')
     .eq('telegram_chat_id', chatId)
     .maybeSingle();
@@ -290,7 +290,7 @@ function storageStateIsValid(storageState) {
 }
 
 async function readActiveSession(chatId) {
-  const { data, error } = await supabase
+  const { data, error } = await azure
     .from('dice_sessions')
     .select('telegram_chat_id, client_id, email, applywizz_id, storage_state')
     .eq('telegram_chat_id', chatId)
@@ -318,7 +318,7 @@ async function saveSession(context, chatId, email, applywizz_id, clientId) {
     throw new Error('Cannot save Dice session: Telegram chat is not linked to a client.');
   }
 
-  const { error } = await supabase.from('dice_sessions').upsert({
+  const { error } = await azure.from('dice_sessions').upsert({
     telegram_chat_id: chatId,
     client_id: resolvedClientId,
     email,
@@ -338,7 +338,7 @@ async function saveSession(context, chatId, email, applywizz_id, clientId) {
 }
 
 async function getAllRegisteredUsers() {
-  const { data, error } = await supabase.from('dice_sessions').select('telegram_chat_id');
+  const { data, error } = await azure.from('dice_sessions').select('telegram_chat_id');
   if (error) {
     console.error('Failed to list Dice sessions:', error.message);
     return [];
@@ -435,10 +435,20 @@ async function refreshLogin(chatId) {
 }
 
 // === JOBS & APPLICATIONS ===
-async function readJobUrls(scrapedAfter = null) {
-  const { data, error } = await supabase
-    .from('jobs')
+async function readJobUrls(scrapedAfter = null, applywizzId = null) {
+  let query = azure
+    .from('dice_scraped_jobs')
     .select('url, title, company, applywizz_id, company_email, scraped_at');
+
+  if (applywizzId) {
+    query = query.eq('applywizz_id', applywizzId);
+  }
+
+  if (scrapedAfter) {
+    query = query.gte('scraped_at', new Date(scrapedAfter).toISOString());
+  }
+
+  const { data, error } = await query;
 
   if (error) {
     console.error('Failed to load jobs:', error.message);
@@ -465,8 +475,8 @@ async function saveAppliedJob(chatId, url, jobName, status) {
     return;
   }
 
-  const { data: job } = await supabase.from('jobs').select('id').eq('url', url).maybeSingle();
-  const { error } = await supabase.from('applications').upsert(
+  const { data: job } = await azure.from('dice_scraped_jobs').select('id').eq('url', url).maybeSingle();
+  const { error } = await azure.from('dice_applied_jobs').upsert(
     {
       client_id: clientId,
       telegram_chat_id: chatId,
@@ -490,8 +500,8 @@ async function hasHandledJob(chatId, url) {
   const clientId = await getClientIdForChat(chatId);
   if (!clientId) return false;
 
-  const { data, error } = await supabase
-    .from('applications')
+  const { data, error } = await azure
+    .from('dice_applied_jobs')
     .select('id')
     .eq('client_id', clientId)
     .eq('url', url)
@@ -560,7 +570,7 @@ async function applyToJobOnPage(page, jobName, url, chatId) {
   }
 
   const clientId = await getClientIdForChat(chatId);
-  const applyProfile = await loadApplyProfile(supabase, clientId);
+  const applyProfile = await loadApplyProfile(azure, clientId);
   console.log('[apply-questions] loaded profile', {
     clientId: clientId || null,
     hasOffice: applyProfile.can_work_3_days_in_office ?? null,
@@ -747,10 +757,13 @@ async function runJobsLoop(chatId) {
       continue;
     }
 
+    const clientId = await getClientIdForChat(chatId);
+    const applyProfile = clientId ? await loadApplyProfile(azure, clientId) : {};
+
     const scrapedAfter = state.newdayRequestedAt
       ? state.newdayRequestedAt - NEWDAY_LOOKBACK_MS
       : null;
-    const jobs = await readJobUrls(scrapedAfter);
+    const jobs = await readJobUrls(scrapedAfter, applyProfile.applywizz_id);
     const urls = jobs.map((job) => job.url);
     const hasNewUrl = urls.some((url) => !state.knownJobUrls.has(url));
     state.knownJobUrls = new Set(urls);
@@ -767,8 +780,6 @@ async function runJobsLoop(chatId) {
 
     let offeredAny = false;
     let unhandledUrlFound = false;
-    const clientId = await getClientIdForChat(chatId);
-    const applyProfile = clientId ? await loadApplyProfile(supabase, clientId) : {};
 
     console.log(`[User ${chatId}] Processing ${jobs.length} jobs. Profile AWL ID: '${applyProfile.applywizz_id}'`);
     for (const job of jobs) {
@@ -927,7 +938,7 @@ async function runJobsLoop(chatId) {
         delayMs: availableAt - Date.now(),
       });
 
-      const { data: jobRow } = await supabase.from('jobs').select('id').eq('url', url).maybeSingle();
+      const { data: jobRow } = await azure.from('dice_scraped_jobs').select('id').eq('url', url).maybeSingle();
 
       try {
         const { row, created, alreadyDone, activeClientJob } = await applyQueue.enqueueApplyJob({
@@ -1345,7 +1356,7 @@ process.once('SIGINT', shutdown);
 process.once('SIGTERM', shutdown);
 
 
-// npm run import-clients -- /full/path/to/new-clients.json --if i store a json file and want to push to supabase
+// npm run import-clients -- /full/path/to/new-clients.json --if i store a json file and want to push to azure
 //CLIENTS_API_URL=https://your-crm.example/clients
 //CLIENTS_API_TOKEN=optional-bearer-token
 //npm run import-clients ---if i want to connect api and add json files directly.
