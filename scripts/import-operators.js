@@ -48,17 +48,17 @@ async function importOperators(records) {
         identifier = mapped.email;
 
         await db.query(
-          `insert into operator_accounts (email, name, role, disabled)
-           values ($1, $2, $3, $4)
+          `insert into operator_accounts (id, email, name, role, disabled)
+           values ($1, $2, $3, $4, $5)
            on conflict (email) do update set
              name = excluded.name,
              role = excluded.role,
              disabled = excluded.disabled`,
-          [mapped.email, mapped.name, mapped.role, mapped.disabled]
+          [mapped.id, mapped.email, mapped.name, mapped.role, mapped.disabled]
         );
 
         imported += 1;
-        console.log(`[ok] ${mapped.email} (${mapped.name} - ${mapped.role})`);
+        console.log(`[ok] ${mapped.id} | ${mapped.email} (${mapped.name} - ${mapped.role})`);
       } catch (error) {
         failed += 1;
         console.error(`[fail] ${identifier}: ${error.message}`);
