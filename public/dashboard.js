@@ -154,6 +154,8 @@ function showLogin() {
   if (state.timer) clearInterval(state.timer);
   loginPanel.hidden = false;
   users.hidden = true;
+  users.innerHTML = '';
+  summary.textContent = '';
   requestOtpForm.hidden = false;
   verifyOtpForm.hidden = true;
   emailError.textContent = '';
