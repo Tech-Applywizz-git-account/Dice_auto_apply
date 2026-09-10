@@ -1,4 +1,4 @@
-const state = { timer: null, data: null };
+const state = { timer: null, data: null, operatorEmail: '' };
 const dateInput = document.querySelector('#date');
 const timezoneInput = document.querySelector('#timezone');
 const statusText = document.querySelector('#status');
@@ -6,32 +6,103 @@ const summary = document.querySelector('#summary');
 const users = document.querySelector('#users');
 const loginPanel = document.querySelector('#login');
 
+const requestOtpForm = document.querySelector('#request-otp-form');
+const verifyOtpForm = document.querySelector('#verify-otp-form');
+const emailInput = document.querySelector('#email');
+const otpInput = document.querySelector('#otp');
+const emailError = document.querySelector('#email-error');
+const otpError = document.querySelector('#otp-error');
+const otpSentInfo = document.querySelector('#otp-sent-info');
+
 const today = new Date();
 dateInput.value = [today.getFullYear(), String(today.getMonth() + 1).padStart(2, '0'), String(today.getDate()).padStart(2, '0')].join('-');
 
 dateInput.addEventListener('change', loadDashboard);
 timezoneInput.addEventListener('change', loadDashboard);
+
 document.querySelector('#logout').addEventListener('click', async () => {
   await fetch('/api/auth/logout', { method: 'POST' });
   showLogin();
 });
-document.querySelector('#login-form').addEventListener('submit', async (event) => {
+
+// Step 1: Request OTP
+requestOtpForm.addEventListener('submit', async (event) => {
   event.preventDefault();
-  const error = document.querySelector('#login-error');
-  error.textContent = '';
-  const response = await fetch('/api/auth/login', {
+  emailError.textContent = '';
+  const email = emailInput.value.trim();
+  if (!email) return;
+
+  const response = await fetch('/api/auth/request-otp', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      email: document.querySelector('#email').value,
-      password: document.querySelector('#password').value,
-    }),
+    body: JSON.stringify({ email }),
   });
+
+  const payload = await response.json();
   if (!response.ok) {
-    error.textContent = (await response.json()).error || 'Sign in failed.';
+    emailError.textContent = payload.error || 'Failed to send OTP.';
     return;
   }
+
+  state.operatorEmail = email;
+  otpSentInfo.textContent = `OTP code sent to ${escapeHtml(email)}. (Valid for 5 minutes)`;
+  otpError.textContent = '';
+  otpInput.value = '';
+  requestOtpForm.hidden = true;
+  verifyOtpForm.hidden = false;
+  otpInput.focus();
+});
+
+// Step 2: Verify OTP
+verifyOtpForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  otpError.textContent = '';
+  const otp = otpInput.value.trim();
+  if (!otp) return;
+
+  const response = await fetch('/api/auth/verify-otp', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email: state.operatorEmail, otp }),
+  });
+
+  const payload = await response.json();
+  if (!response.ok) {
+    otpError.textContent = payload.error || 'Verification failed.';
+    return;
+  }
+
   await loadDashboard();
+});
+
+// Resend OTP
+document.querySelector('#resend-otp-btn').addEventListener('click', async () => {
+  otpError.textContent = '';
+  if (!state.operatorEmail) return;
+
+  const response = await fetch('/api/auth/resend-otp', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email: state.operatorEmail }),
+  });
+
+  const payload = await response.json();
+  if (!response.ok) {
+    otpError.textContent = payload.error || 'Failed to resend OTP.';
+    return;
+  }
+
+  otpInput.value = '';
+  otpSentInfo.textContent = `New OTP code sent to ${escapeHtml(state.operatorEmail)}. Previous code invalidated.`;
+  otpInput.focus();
+});
+
+// Change Email link
+document.querySelector('#change-email-btn').addEventListener('click', () => {
+  requestOtpForm.hidden = false;
+  verifyOtpForm.hidden = true;
+  emailError.textContent = '';
+  emailInput.focus();
 });
 
 async function loadDashboard() {
@@ -83,7 +154,11 @@ function showLogin() {
   if (state.timer) clearInterval(state.timer);
   loginPanel.hidden = false;
   users.hidden = true;
-  statusText.textContent = 'Sign in to view workflow activity.';
+  requestOtpForm.hidden = false;
+  verifyOtpForm.hidden = true;
+  emailError.textContent = '';
+  otpError.textContent = '';
+  statusText.textContent = 'Sign in with Email and OTP to view workflow activity.';
 }
 
 function startPolling() {

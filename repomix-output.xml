@@ -45,6 +45,7 @@ data/
 database/
   migrations/
     001_dashboard_operator.sql
+    002_workflow_newday.sql
 lib/
   apply-queue.js
   apply-worker.js
@@ -79,2196 +80,6 @@ package.json
 
 <files>
 This section contains the contents of the repository's files.
-
-<file path="database/migrations/001_dashboard_operator.sql">
-create table if not exists public.operator_accounts (
-  id uuid primary key default gen_random_uuid(),
-  email text not null unique,
-  password_hash text not null,
-  disabled boolean not null default false,
-  created_at timestamptz not null default now()
-);
-
-create table if not exists public.operator_sessions (
-  token_hash text primary key,
-  operator_id uuid not null references public.operator_accounts(id) on delete cascade,
-  expires_at timestamptz not null,
-  created_at timestamptz not null default now(),
-  revoked_at timestamptz
-);
-
-create index if not exists operator_sessions_active_idx
-  on public.operator_sessions (token_hash, expires_at)
-  where revoked_at is null;
-
-create index if not exists workflow_audit_logs_dashboard_idx
-  on public.workflow_audit_logs (created_at, telegram_chat_id);
-
-create index if not exists workflow_prompt_events_dashboard_idx
-  on public.workflow_prompt_events (sent_at, telegram_chat_id);
-</file>
-
-<file path="lib/dashboard-server.js">
-const http = require('http');
-const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
-const bcrypt = require('bcryptjs');
-
-const DASHBOARD_TIMEZONES = {
-  browser: null,
-  UTC: 'UTC',
-  Pacific: 'America/Los_Angeles',
-  Mountain: 'America/Denver',
-  Central: 'America/Chicago',
-  Eastern: 'America/New_York',
-};
-const SESSION_DAYS = 7;
-const dashboardRoot = path.join(__dirname, '..', 'public');
-
-function createDashboardServer({ db }) {
-  return http.createServer(async (request, response) => {
-    try {
-      await routeRequest(request, response, db);
-    } catch (error) {
-      console.error('[dashboard] request failed:', error.message);
-      sendJson(response, 500, { error: 'Dashboard request failed.' });
-    }
-  });
-}
-
-async function routeRequest(request, response, db) {
-  const requestUrl = new URL(request.url, 'http://localhost');
-  const pathname = requestUrl.pathname;
-
-  if (request.method === 'GET' && pathname === '/dashboard') {
-    return sendFile(response, 'dashboard.html', 'text/html; charset=utf-8');
-  }
-  if (request.method === 'GET' && pathname === '/dashboard.js') {
-    return sendFile(response, 'dashboard.js', 'application/javascript; charset=utf-8');
-  }
-  if (request.method === 'GET' && pathname === '/dashboard.css') {
-    return sendFile(response, 'dashboard.css', 'text/css; charset=utf-8');
-  }
-  if (request.method === 'POST' && pathname === '/api/auth/login') {
-    return login(request, response, db);
-  }
-  if (request.method === 'POST' && pathname === '/api/auth/logout') {
-    return logout(request, response, db);
-  }
-  if (request.method === 'GET' && pathname === '/api/auth/session') {
-    return authenticate(request, response, db, () => sendJson(response, 200, { authenticated: true }));
-  }
-  if (request.method === 'GET' && pathname === '/api/dashboard') {
-    return authenticate(request, response, db, () => readDashboard(requestUrl, response, db));
-  }
-
-  sendJson(response, 404, { error: 'Not found.' });
-}
-
-async function login(request, response, db) {
-  const body = await readJson(request);
-  const email = String(body.email || '').trim().toLowerCase();
-  const password = String(body.password || '');
-  if (!email || !password) return sendJson(response, 400, { error: 'Email and password are required.' });
-
-  const result = await db.query(
-    `select id, email, password_hash
-       from operator_accounts
-      where lower(email) = $1 and disabled = false
-      limit 1`,
-    [email]
-  );
-  const account = result.rows[0];
-  if (!account || !await bcrypt.compare(password, account.password_hash)) {
-    return sendJson(response, 401, { error: 'Invalid credentials.' });
-  }
-
-  const rawToken = crypto.randomBytes(32).toString('hex');
-  const tokenHash = hashToken(rawToken);
-  await db.query(
-    `insert into operator_sessions (token_hash, operator_id, expires_at)
-     values ($1, $2, now() + ($3 * interval '1 day'))`,
-    [tokenHash, account.id, SESSION_DAYS]
-  );
-  setCookie(response, 'dashboard_session', rawToken, SESSION_DAYS * 24 * 60 * 60);
-  sendJson(response, 200, { authenticated: true, email: account.email });
-}
-
-async function logout(request, response, db) {
-  const token = readCookie(request, 'dashboard_session');
-  if (token) {
-    await db.query(
-      `update operator_sessions set revoked_at = now()
-        where token_hash = $1 and revoked_at is null`,
-      [hashToken(token)]
-    );
-  }
-  setCookie(response, 'dashboard_session', '', 0);
-  sendJson(response, 200, { authenticated: false });
-}
-
-async function authenticate(request, response, db, handler) {
-  const token = readCookie(request, 'dashboard_session');
-  if (!token) return sendJson(response, 401, { error: 'Authentication required.' });
-  const result = await db.query(
-    `select operator_id
-       from operator_sessions
-      where token_hash = $1
-        and revoked_at is null
-        and expires_at > now()
-      limit 1`,
-    [hashToken(token)]
-  );
-  if (!result.rows[0]) return sendJson(response, 401, { error: 'Authentication required.' });
-  return handler(result.rows[0].operator_id);
-}
-
-async function readDashboard(requestUrl, response, db) {
-  const date = requestUrl.searchParams.get('date');
-  const timezone = requestUrl.searchParams.get('timezone') || 'browser';
-  const timezoneName = DASHBOARD_TIMEZONES[timezone];
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '')) return sendJson(response, 400, { error: 'date must be YYYY-MM-DD.' });
-  if (!(timezone in DASHBOARD_TIMEZONES)) return sendJson(response, 400, { error: 'Unsupported timezone.' });
-
-  const zone = timezoneName || 'UTC';
-  const bounds = await db.query(
-    `select ($1::date::timestamp at time zone $2) as start_at,
-            (($1::date + interval '1 day')::timestamp at time zone $2) as end_at`,
-    [date, zone]
-  );
-  const { start_at: startAt, end_at: endAt } = bounds.rows[0];
-
-  const [users, sessions, audits, prompts, applications, queue] = await Promise.all([
-    db.query(`
-      select distinct on (ds.telegram_chat_id)
-        ds.telegram_chat_id, ds.client_id, c.full_name, c.company_email, c.applywizz_id
-      from dice_sessions ds
-      left join clients c on c.id = ds.client_id
-      order by ds.telegram_chat_id, ds.updated_at desc nulls last`),
-    db.query(`
-      select telegram_chat_id, session_started_at, session_deadline, next_scan_at,
-             last_decision, last_decision_at, current_prompt_url,
-             current_prompt_sent_at, current_prompt_expires_at
-      from workflow_sessions
-      where session_started_at < $2 and coalesce(session_deadline, session_started_at) >= $1`, [startAt, endAt]),
-    db.query(`
-      select id, telegram_chat_id, event, details, created_at
-      from workflow_audit_logs
-      where created_at >= $1 and created_at < $2
-      order by created_at asc, id asc`, [startAt, endAt]),
-    db.query(`
-      select id, telegram_chat_id, prompt_token, url, sent_at, expires_at,
-             decision, clicked_at
-      from workflow_prompt_events
-      where sent_at >= $1 and sent_at < $2
-      order by sent_at asc, id asc`, [startAt, endAt]),
-    db.query(`
-      select id, client_id, telegram_chat_id, job_id, url, job_name, status, applied_at
-      from applications
-      where applied_at >= $1 and applied_at < $2
-      order by applied_at asc, id asc`, [startAt, endAt]),
-    db.query(`
-      select id, client_id, telegram_chat_id, job_id, url, status, available_at,
-             created_at, started_at, finished_at, attempts, max_attempts, last_error
-      from apply_queue
-      where created_at >= $1 and created_at < $2
-      order by created_at asc, id asc`, [startAt, endAt]),
-  ]);
-
-  const userMap = new Map(users.rows.map((user) => [String(user.telegram_chat_id), {
-    ...user,
-    has_activity: false,
-    session: sessions.rows.find((row) => String(row.telegram_chat_id) === String(user.telegram_chat_id)) || null,
-    audit_logs: [],
-    prompt_events: [],
-    applications: [],
-    queue: [],
-  }]));
-  const ensureUser = (chatId) => {
-    const key = String(chatId);
-    if (!userMap.has(key)) userMap.set(key, {
-      telegram_chat_id: chatId,
-      full_name: null,
-      company_email: null,
-      applywizz_id: null,
-      has_activity: false,
-      session: null,
-      audit_logs: [],
-      prompt_events: [],
-      applications: [],
-      queue: [],
-    });
-    return userMap.get(key);
-  };
-
-  audits.rows.forEach((row) => { const user = ensureUser(row.telegram_chat_id); user.audit_logs.push(row); user.has_activity = true; });
-  prompts.rows.forEach((row) => { const user = ensureUser(row.telegram_chat_id); user.prompt_events.push(row); user.has_activity = true; });
-  applications.rows.forEach((row) => { const user = ensureUser(row.telegram_chat_id); user.applications.push(row); user.has_activity = true; });
-  queue.rows.forEach((row) => { const user = ensureUser(row.telegram_chat_id); user.queue.push(row); user.has_activity = true; });
-
-  sendJson(response, 200, {
-    date,
-    timezone,
-    start_at: startAt,
-    end_at: endAt,
-    users: [...userMap.values()].sort((left, right) => String(left.full_name || left.company_email || left.telegram_chat_id).localeCompare(String(right.full_name || right.company_email || right.telegram_chat_id))),
-  });
-}
-
-function readJson(request) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    request.on('data', (chunk) => {
-      body += chunk;
-      if (body.length > 1024 * 1024) reject(new Error('Request body is too large.'));
-    });
-    request.on('end', () => {
-      try { resolve(body ? JSON.parse(body) : {}); } catch (error) { reject(new Error('Invalid JSON body.')); }
-    });
-    request.on('error', reject);
-  });
-}
-
-function sendFile(response, fileName, contentType) {
-  const filePath = path.join(dashboardRoot, fileName);
-  if (!fs.existsSync(filePath)) return sendJson(response, 404, { error: 'Dashboard asset not found.' });
-  response.writeHead(200, { 'content-type': contentType, 'cache-control': 'no-store' });
-  response.end(fs.readFileSync(filePath));
-}
-
-function sendJson(response, status, payload) {
-  response.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store',
-  });
-  response.end(JSON.stringify(payload));
-}
-
-function hashToken(token) {
-  return crypto.createHash('sha256').update(token).digest('hex');
-}
-
-function readCookie(request, name) {
-  const cookies = String(request.headers.cookie || '').split(';');
-  const item = cookies.find((cookie) => cookie.trim().startsWith(`${name}=`));
-  return item ? decodeURIComponent(item.trim().slice(name.length + 1)) : null;
-}
-
-function setCookie(response, name, value, maxAge) {
-  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
-  response.setHeader('set-cookie', `${name}=${encodeURIComponent(value)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`);
-}
-
-module.exports = {
-  createDashboardServer,
-  DASHBOARD_TIMEZONES,
-};
-</file>
-
-<file path="lib/job-matching.js">
-const STOP_WORDS = new Set([
-  'a', 'an', 'and', 'at', 'for', 'in', 'of', 'on', 'or', 'the', 'to', 'with',
-]);
-
-function normalizeText(value) {
-  return String(value || '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim();
-}
-
-function tokens(value) {
-  return new Set(
-    normalizeText(value)
-      .split(/\s+/)
-      .filter((token) => token && !STOP_WORDS.has(token))
-  );
-}
-
-function roleMatchesJobTitle(jobTitle, roles, threshold = 0.75) {
-  const jobTokens = tokens(jobTitle);
-  if (!jobTokens.size) return false;
-
-  return (Array.isArray(roles) ? roles : [roles]).filter(Boolean).some((role) => {
-    const roleTokens = tokens(role);
-    if (!roleTokens.size) return false;
-
-    let overlap = 0;
-    for (const token of roleTokens) {
-      if (jobTokens.has(token)) overlap += 1;
-    }
-
-    const containment = overlap / Math.min(jobTokens.size, roleTokens.size);
-    const jaccard = overlap / (jobTokens.size + roleTokens.size - overlap);
-    return Math.max(containment, jaccard * 1.25) >= threshold;
-  });
-}
-
-function companyIsExcluded(company, excludedCompanies) {
-  const normalizedCompany = normalizeText(company);
-  if (!normalizedCompany) return false;
-
-  const exclusions = Array.isArray(excludedCompanies)
-    ? excludedCompanies
-    : String(excludedCompanies || '').split(/[,;|]/);
-
-  return exclusions.some((excluded) => {
-    const normalizedExcluded = normalizeText(excluded);
-    return normalizedExcluded
-      && (normalizedCompany === normalizedExcluded
-        || normalizedCompany.includes(normalizedExcluded)
-        || normalizedExcluded.includes(normalizedCompany));
-  });
-}
-
-function jobMatchesProfile(job, profile) {
-  const alternateRoles = Array.isArray(profile?.alternate_job_roles)
-    ? profile.alternate_job_roles
-    : String(profile?.alternate_job_roles || '').split(/[,;|]/);
-  const roles = [profile?.role, ...alternateRoles];
-
-  return roleMatchesJobTitle(job.title, roles)
-    && !companyIsExcluded(job.company, profile?.exclude_companies);
-}
-
-module.exports = {
-  companyIsExcluded,
-  jobMatchesProfile,
-  normalizeText,
-  roleMatchesJobTitle,
-};
-</file>
-
-<file path="public/dashboard.css">
-:root {
-  color-scheme: light;
-  --ink: #17221e;
-  --muted: #68756f;
-  --paper: #f4f1e8;
-  --panel: #fffdf7;
-  --line: #d8d4c7;
-  --accent: #c95638;
-  --accent-dark: #8d3425;
-  --green: #2f7358;
-  font-family: Georgia, 'Times New Roman', serif;
-}
-
-* { box-sizing: border-box; }
-body { margin: 0; color: var(--ink); background: radial-gradient(circle at 15% 0%, #fff9e8 0, var(--paper) 40%, #e6eee6 100%); min-height: 100vh; }
-.shell { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 42px 0 72px; }
-.topbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; border-bottom: 1px solid var(--line); padding-bottom: 24px; }
-.eyebrow { color: var(--accent); font: 700 12px/1.2 Arial, sans-serif; letter-spacing: 2px; text-transform: uppercase; margin: 0 0 10px; }
-h1, h2, h3, p { margin-top: 0; }
-h1 { font-size: clamp(34px, 6vw, 68px); line-height: .96; margin-bottom: 12px; font-weight: 500; }
-h2 { font-size: 25px; font-weight: 500; }
-.muted { color: var(--muted); font: 14px/1.5 Arial, sans-serif; }
-.controls { display: flex; align-items: end; flex-wrap: wrap; gap: 16px; padding: 22px 0; }
-label { display: grid; gap: 7px; color: var(--muted); font: 12px/1.2 Arial, sans-serif; text-transform: uppercase; letter-spacing: .8px; }
-input, select { border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--ink); padding: 11px 12px; font: 16px Georgia, serif; text-transform: none; letter-spacing: 0; }
-.summary { margin-left: auto; color: var(--green); font: 700 14px Arial, sans-serif; }
-.button { border: 0; border-radius: 4px; background: var(--accent); color: white; cursor: pointer; padding: 11px 16px; font: 700 13px Arial, sans-serif; }
-.button:hover { background: var(--accent-dark); }
-.button.secondary { background: transparent; border: 1px solid var(--line); color: var(--ink); }
-.users { display: grid; gap: 10px; }
-.user { background: rgba(255, 253, 247, .84); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
-.user summary { cursor: pointer; list-style: none; display: grid; grid-template-columns: minmax(180px, 1.3fr) minmax(120px, 1fr) auto; gap: 18px; align-items: center; padding: 18px 20px; }
-.user summary::-webkit-details-marker { display: none; }
-.user summary:hover { background: #fff9e9; }
-.user-name { font-size: 20px; }
-.user-email, .user-meta { color: var(--muted); font: 13px/1.4 Arial, sans-serif; }
-.badge { color: var(--green); font: 700 12px Arial, sans-serif; text-align: right; }
-.badge.idle { color: var(--muted); }
-.user-body { border-top: 1px solid var(--line); padding: 20px; display: grid; gap: 24px; }
-.timer { display: flex; flex-wrap: wrap; gap: 12px; }
-.metric { min-width: 150px; padding: 12px; border-left: 3px solid var(--accent); background: #f8f5eb; }
-.metric strong { display: block; font-size: 18px; font-weight: 500; }
-.metric span { color: var(--muted); font: 11px Arial, sans-serif; text-transform: uppercase; }
-.columns { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
-.panel h3 { font-size: 16px; border-bottom: 1px solid var(--line); padding-bottom: 8px; margin-bottom: 0; }
-.log { display: grid; grid-template-columns: 155px 1fr; gap: 12px; border-bottom: 1px solid #e7e2d5; padding: 10px 0; font: 13px/1.45 Arial, sans-serif; }
-.log time { color: var(--muted); }
-.log strong { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
-.log pre { white-space: pre-wrap; margin: 4px 0 0; color: var(--muted); font: 12px/1.4 ui-monospace, monospace; }
-.login-panel { max-width: 420px; background: var(--panel); border: 1px solid var(--line); padding: 24px; }
-.login-panel form { display: grid; gap: 16px; }
-.error { color: var(--accent-dark); font: 13px Arial, sans-serif; min-height: 18px; }
-@media (max-width: 700px) {
-  .shell { width: min(100% - 20px, 1180px); padding-top: 24px; }
-  .topbar { align-items: flex-start; }
-  .user summary { grid-template-columns: 1fr auto; }
-  .user-email { grid-column: 1 / -1; grid-row: 2; }
-  .badge { grid-column: 2; grid-row: 1; }
-  .columns { grid-template-columns: 1fr; }
-  .log { grid-template-columns: 1fr; gap: 4px; }
-  .summary { margin-left: 0; width: 100%; }
-}
-</file>
-
-<file path="public/dashboard.html">
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Workflow dashboard</title>
-  <link rel="stylesheet" href="/dashboard.css">
-</head>
-<body>
-  <main class="shell">
-    <header class="topbar">
-      <div>
-        <p class="eyebrow">Operations</p>
-        <h1>Workflow dashboard</h1>
-        <p class="muted" id="status">Loading...</p>
-      </div>
-      <button class="button secondary" id="logout">Log out</button>
-    </header>
-
-    <section class="controls" aria-label="Dashboard filters">
-      <label>Date <input type="date" id="date"></label>
-      <label>Timezone
-        <select id="timezone">
-          <option value="browser">Browser local</option>
-          <option value="UTC">UTC</option>
-          <option value="Pacific">Pacific</option>
-          <option value="Mountain">Mountain</option>
-          <option value="Central">Central</option>
-          <option value="Eastern">Eastern</option>
-        </select>
-      </label>
-      <div class="summary" id="summary"></div>
-    </section>
-
-    <section id="login" class="login-panel" hidden>
-      <h2>Operator sign in</h2>
-      <form id="login-form">
-        <label>Email <input type="email" id="email" required autocomplete="username"></label>
-        <label>Password <input type="password" id="password" required autocomplete="current-password"></label>
-        <button class="button" type="submit">Sign in</button>
-        <p class="error" id="login-error"></p>
-      </form>
-    </section>
-
-    <section id="users" class="users" hidden></section>
-  </main>
-  <script src="/dashboard.js"></script>
-</body>
-</html>
-</file>
-
-<file path="scripts/create-operator.js">
-require('dotenv').config();
-
-const bcrypt = require('bcryptjs');
-const { createPool } = require('../lib/supabase');
-
-const args = new Map();
-for (let index = 2; index < process.argv.length; index += 1) {
-  const [key, value] = process.argv[index].split('=', 2);
-  if (key && value) args.set(key.replace(/^--/, ''), value);
-}
-
-const email = String(args.get('email') || '').trim().toLowerCase();
-const password = String(args.get('password') || '');
-
-if (!email || !email.includes('@') || password.length < 12) {
-  console.error('Usage: npm run create-operator -- --email=operator@example.com --password="at-least-12-characters"');
-  process.exit(1);
-}
-
-(async () => {
-  const db = createPool();
-  const passwordHash = await bcrypt.hash(password, 12);
-  await db.query(
-    `insert into operator_accounts (email, password_hash)
-     values ($1, $2)
-     on conflict (email) do update set password_hash = excluded.password_hash, disabled = false`,
-    [email, passwordHash]
-  );
-  console.log(`Operator account ready: ${email}`);
-  await db.end();
-})().catch(async (error) => {
-  console.error(`Could not create operator: ${error.message}`);
-  process.exitCode = 1;
-});
-</file>
-
-<file path="scripts/import-clients.js">
-require('dotenv').config();
-
-const fs = require('fs');
-const path = require('path');
-const { createServiceClient } = require('../lib/supabase');
-const { mapImportItem } = require('./map-client-record');
-
-async function loadRecords() {
-  const apiUrl = process.env.CLIENTS_API_URL;
-  if (apiUrl) {
-    const headers = { Accept: 'application/json' };
-    if (process.env.CLIENTS_API_TOKEN) {
-      headers.Authorization = `Bearer ${process.env.CLIENTS_API_TOKEN}`;
-    }
-    const response = await fetch(apiUrl, { headers });
-    if (!response.ok) {
-      throw new Error(`CLIENTS_API_URL failed: ${response.status} ${response.statusText}`);
-    }
-    const payload = await response.json();
-    if (Array.isArray(payload)) return payload;
-    if (Array.isArray(payload.records)) return payload.records;
-    if (Array.isArray(payload.data)) return payload.data;
-    if (payload.client) return [payload];
-    throw new Error('API response was not an array of client records.');
-  }
-
-  const filePath = process.argv[2] || path.join('data', 'sample-clients.json');
-  const resolved = path.resolve(filePath);
-  if (!fs.existsSync(resolved)) {
-    throw new Error(`Import file not found: ${resolved}`);
-  }
-  const payload = JSON.parse(fs.readFileSync(resolved, 'utf8'));
-  if (Array.isArray(payload)) return payload;
-  if (payload.client) return [payload];
-  throw new Error('JSON file must be an array of { client, additional_information } records.');
-}
-
-async function importRecords(records) {
-  const supabase = createServiceClient();
-  let imported = 0;
-  let failed = 0;
-
-  for (const [index, item] of records.entries()) {
-    let applywizzId = `row ${index + 1}`;
-    try {
-      const { clientRow, profileRow } = mapImportItem(item);
-      applywizzId = clientRow.applywizz_id;
-
-      const { error: clientError } = await supabase
-        .from('clients')
-        .upsert(clientRow, { onConflict: 'id' });
-      if (clientError) throw clientError;
-
-      if (profileRow) {
-        const { error: profileError } = await supabase
-          .from('client_profiles')
-          .upsert(profileRow, { onConflict: 'id' });
-        if (profileError) throw profileError;
-      }
-
-      imported += 1;
-      console.log(`[ok] ${applywizzId} (${clientRow.company_email})`);
-    } catch (error) {
-      failed += 1;
-      console.error(`[fail] ${applywizzId}: ${error.message}`);
-    }
-  }
-
-  console.log(`Import finished. imported=${imported} failed=${failed} total=${records.length}`);
-  if (failed > 0 && imported === 0) process.exit(1);
-}
-
-loadRecords()
-  .then(importRecords)
-  .catch((error) => {
-    console.error(error.message);
-    process.exit(1);
-  });
-</file>
-
-<file path="scripts/map-client-record.js">
-const crypto = require('crypto');
-
-function asText(value) {
-  if (value == null) return null;
-  const text = String(value).trim();
-  return text === '' ? null : text;
-}
-
-function asUuid(value) {
-  const text = asText(value);
-  if (!text || text === '-') return null;
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(text)
-    ? text
-    : null;
-}
-
-function asDate(value) {
-  const text = asText(value);
-  if (!text) return null;
-  if (/^\d{4}-\d{2}-\d{2}/.test(text)) return text.slice(0, 10);
-  const parsed = new Date(text);
-  if (Number.isNaN(parsed.getTime())) return null;
-  return parsed.toISOString().slice(0, 10);
-}
-
-function asTimestamptz(value) {
-  const text = asText(value);
-  if (!text) return null;
-  const parsed = new Date(text);
-  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
-}
-
-function asBoolean(value) {
-  if (value == null || value === '') return null;
-  if (typeof value === 'boolean') return value;
-  const text = String(value).trim().toLowerCase();
-  if (['true', 'yes', '1'].includes(text)) return true;
-  if (['false', 'no', '0'].includes(text)) return false;
-  return null;
-}
-
-function asInteger(value) {
-  if (value == null || value === '') return null;
-  const number = Number(value);
-  return Number.isInteger(number) ? number : null;
-}
-
-function asTextArray(value) {
-  if (value == null || value === '') return null;
-  if (Array.isArray(value)) {
-    const items = value.map((item) => String(item).trim()).filter(Boolean);
-    return items.length ? items : null;
-  }
-  return null;
-}
-
-function parseExcludeCompanies(value) {
-  if (value == null || value === '') return { parsed: null, raw: null };
-  if (Array.isArray(value)) {
-    const parsed = value.flatMap((item) => String(item).split(',').map((part) => part.trim()).filter(Boolean));
-    return { parsed: parsed.length ? parsed : null, raw: JSON.stringify(value) };
-  }
-
-  const raw = String(value);
-  try {
-    const parsedJson = JSON.parse(raw);
-    if (Array.isArray(parsedJson)) {
-      const parsed = parsedJson.flatMap((item) => String(item).split(',').map((part) => part.trim()).filter(Boolean));
-      return { parsed: parsed.length ? parsed : null, raw };
-    }
-  } catch {
-    // keep raw string
-  }
-
-  const parsed = raw.split(',').map((part) => part.replace(/[[\]"]/g, '').trim()).filter(Boolean);
-  return { parsed: parsed.length ? parsed : null, raw };
-}
-
-function unwrapRecord(item) {
-  if (!item || typeof item !== 'object') return { client: null, additional: null };
-  if (item.client) {
-    return { client: item.client, additional: item.additional_information || null };
-  }
-  return { client: item, additional: item.additional_information || null };
-}
-
-function mapClientRow(client) {
-  const companyEmail = asText(client.company_email);
-  const applywizzId = asText(client.applywizz_id);
-  if (!companyEmail || !applywizzId) {
-    throw new Error('client is missing company_email or applywizz_id');
-  }
-
-  return {
-    id: asUuid(client.id) || crypto.randomUUID(),
-    applywizz_id: applywizzId,
-    full_name: asText(client.full_name || client.name),
-    personal_email: asText(client.personal_email),
-    company_email: companyEmail,
-    whatsapp_number: asText(client.whatsapp_number),
-    callable_phone: asText(client.callable_phone || client.phone),
-    job_role_preferences: asTextArray(client.job_role_preferences),
-    salary_range: asText(client.salary_range),
-    location_preferences: asTextArray(client.location_preferences),
-    work_auth_details: asText(client.work_auth_details),
-    account_manager_id: asUuid(client.account_manager_id),
-    onboarded_by: asUuid(client.onboarded_by),
-    career_associate_id: asUuid(client.careerassociateid || client.career_associate_id),
-    scraper_id: asUuid(client.scraperid || client.scraper_id),
-    career_associate_manager_id: asUuid(client.careerassociatemanagerid || client.career_associate_manager_id),
-    client_office_id: asText(client.clientofficeid || client.client_office_id),
-    onboarding_date: asDate(client.onboardingdate || client.onboarding_date),
-    visa_type: asText(client.visa_type),
-    sponsorship: asBoolean(client.sponsorship),
-    badge_value: asInteger(client.badge_value),
-    coding_labs: asBoolean(client.coding_labs),
-    coding_lab_url: asText(client.coding_lab_url),
-    opted_job_links: asBoolean(client.opted_job_links),
-    lab_id_1: asUuid(client.lab_id_1),
-    lab_id_2: asUuid(client.lab_id_2),
-    mcq_results: client.mcq_results ?? null,
-    test_results: client.test_results ?? null,
-    status: asText(client.status),
-    role_last_updated: asTimestamptz(client.role_last_updated),
-    crm_created_at: asTimestamptz(client.created_at),
-    crm_updated_at: asTimestamptz(client.update_at || client.updated_at),
-    imported_at: new Date().toISOString(),
-    raw_payload: client,
-  };
-}
-
-function mapProfileRow(clientId, applywizzId, additional) {
-  if (!additional || typeof additional !== 'object') return null;
-  const exclude = parseExcludeCompanies(additional.exclude_companies);
-
-  return {
-    id: asUuid(additional.id) || clientId,
-    applywizz_id: asText(additional.applywizz_id) || applywizzId,
-    resume_url: asText(additional.resume_url),
-    resume_path: asText(additional.resume_path),
-    cover_letter_path: asText(additional.cover_letter_path),
-    google_drive_resume_link: asText(additional.google_drive_resume_link),
-    start_date: asDate(additional.start_date),
-    end_date: asDate(additional.end_date),
-    no_of_applications: asInteger(additional.no_of_applications),
-    is_over_18: asBoolean(additional.is_over_18),
-    eligible_to_work_in_us: asBoolean(additional.eligible_to_work_in_us),
-    authorized_without_visa: asBoolean(additional.authorized_without_visa),
-    require_future_sponsorship: asBoolean(additional.require_future_sponsorship),
-    can_perform_essential_functions: asBoolean(additional.can_perform_essential_functions),
-    worked_for_company_before: asBoolean(additional.worked_for_company_before),
-    discharged_for_policy_violation: asBoolean(additional.discharged_for_policy_violation),
-    referred_by_agency: asBoolean(additional.referred_by_agency),
-    highest_education: asText(additional.highest_education),
-    university_name: asText(additional.university_name),
-    cumulative_gpa: asText(additional.cumulative_gpa),
-    desired_start_date: asDate(additional.desired_start_date),
-    willing_to_relocate: asBoolean(additional.willing_to_relocate),
-    can_work_3_days_in_office: asBoolean(additional.can_work_3_days_in_office),
-    role: asText(additional.role),
-    experience: additional.experience == null ? null : String(additional.experience),
-    work_preferences: asText(additional.work_preferences),
-    alternate_job_roles: asText(additional.alternate_job_roles),
-    exclude_companies: exclude.parsed,
-    exclude_companies_raw: exclude.raw,
-    convicted_of_felony: asBoolean(additional.convicted_of_felony),
-    felony_explanation: asText(additional.felony_explanation),
-    pending_investigation: asBoolean(additional.pending_investigation),
-    willing_background_check: asBoolean(additional.willing_background_check),
-    willing_drug_screen: asBoolean(additional.willing_drug_screen),
-    failed_or_refused_drug_test: asBoolean(additional.failed_or_refused_drug_test),
-    uses_substances_affecting_duties: asBoolean(additional.uses_substances_affecting_duties),
-    substances_description: asText(additional.substances_description),
-    can_provide_legal_docs: asBoolean(additional.can_provide_legal_docs),
-    gender: asText(additional.gender),
-    is_hispanic_latino: asText(additional.is_hispanic_latino),
-    race_ethnicity: asText(additional.race_ethnicity),
-    veteran_status: asText(additional.veteran_status),
-    disability_status: asText(additional.disability_status),
-    has_relatives_in_company: asBoolean(additional.has_relatives_in_company),
-    relatives_details: asText(additional.relatives_details),
-    state_of_residence: asText(additional.state_of_residence),
-    zip_or_country: asText(additional.zip_or_country),
-    full_address: asText(additional.full_address),
-    date_of_birth: asDate(additional.date_of_birth),
-    primary_phone: asText(additional.primary_phone),
-    main_subject: asText(additional.main_subject),
-    graduation_year: additional.graduation_year == null ? null : String(additional.graduation_year),
-    add_ons_info: asTextArray(additional.add_ons_info),
-    github_url: asText(additional.github_url),
-    linked_in_url: asText(additional.linked_in_url),
-    client_form_fill_date: asTimestamptz(additional.client_form_fill_date),
-    working_status: asText(additional.working_status),
-    crm_created_at: asTimestamptz(additional.created_at),
-    crm_updated_at: asTimestamptz(additional.updated_at),
-    raw_payload: additional,
-  };
-}
-
-function mapImportItem(item) {
-  const { client, additional } = unwrapRecord(item);
-  if (!client) throw new Error('record is missing client data');
-  const clientRow = mapClientRow(client);
-  const profileRow = mapProfileRow(clientRow.id, clientRow.applywizz_id, additional);
-  return { clientRow, profileRow };
-}
-
-module.exports = {
-  mapImportItem,
-};
-</file>
-
-<file path="scripts/smoke-browserbase.js">
-require('dotenv').config();
-
-const { openBrowser, closeBrowser, useBrowserbase } = require('../lib/browser');
-
-async function main() {
-  if (!useBrowserbase) {
-    throw new Error('Set USE_BROWSERBASE=true to run this smoke test.');
-  }
-  if (!process.env.BROWSERBASE_API_KEY) {
-    throw new Error('BROWSERBASE_API_KEY is missing.');
-  }
-  if (!process.env.BROWSERBASE_PROJECT_ID) {
-    throw new Error('BROWSERBASE_PROJECT_ID is missing. Copy it from Browserbase Settings.');
-  }
-
-  console.log('Opening Browserbase session...');
-  const handle = await openBrowser({ headless: true });
-  try {
-    console.log(`sessionId=${handle.sessionId}`);
-    console.log(`provider=${handle.provider}`);
-    await handle.page.goto('https://example.com', { waitUntil: 'domcontentloaded', timeout: 60000 });
-    const title = await handle.page.title();
-    console.log(`page title: ${title}`);
-    console.log(`replay: https://www.browserbase.com/sessions/${handle.sessionId}`);
-    console.log('Smoke test OK');
-  } finally {
-    await closeBrowser(handle);
-  }
-}
-
-main().catch((error) => {
-  console.error('Smoke test failed:', error.message);
-  process.exit(1);
-});
-</file>
-
-<file path="scripts/verify-client-lookup.js">
-require('dotenv').config();
-
-const { createServiceClient } = require('../lib/supabase');
-
-const email = (process.argv[2] || 'ramgopalvarma8520@gmail.com').trim();
-
-async function main() {
-  const supabase = createServiceClient();
-  const { data: client, error } = await supabase
-    .from('clients')
-    .select('id, applywizz_id, company_email, full_name')
-    .eq('company_email', email)
-    .maybeSingle();
-
-  if (error) throw error;
-  if (!client) {
-    throw new Error(`No client found for ${email}`);
-  }
-
-  const { data: profile, error: profileError } = await supabase
-    .from('client_profiles')
-    .select('id, applywizz_id, role, resume_path')
-    .eq('id', client.id)
-    .maybeSingle();
-  if (profileError) throw profileError;
-
-  console.log(JSON.stringify({
-    lookup: email,
-    client,
-    profile: profile || null,
-    applywizz_id_ok: client.applywizz_id === 'AWL-001' || Boolean(client.applywizz_id),
-  }, null, 2));
-}
-
-main().catch((error) => {
-  console.error(error.message);
-  process.exit(1);
-});
-</file>
-
-<file path="test/apply-queue.test.js">
-const test = require('node:test');
-const assert = require('node:assert/strict');
-const { createApplyQueue } = require('../lib/apply-queue');
-
-test('hasActiveClientJob detects queued or running work for the same client', async () => {
-  const supabase = {
-    from(table) {
-      assert.equal(table, 'apply_queue');
-      return {
-        select() {
-          return {
-            eq() {
-              return {
-                in() {
-                  return {
-                    maybeSingle: async () => ({
-                      data: { id: 101, status: 'queued' },
-                      error: null,
-                    }),
-                  };
-                },
-              };
-            },
-          };
-        },
-      };
-    },
-  };
-
-  const queue = createApplyQueue(supabase);
-  const active = await queue.hasActiveClientJob(42);
-  assert.equal(active, true);
-});
-</file>
-
-<file path="test/job-matching.test.js">
-const test = require('node:test');
-const assert = require('node:assert/strict');
-const { companyIsExcluded, jobMatchesProfile, roleMatchesJobTitle } = require('../lib/job-matching');
-
-test('matches close job titles against primary or alternate roles', () => {
-  assert.equal(roleMatchesJobTitle('Senior Backend Software Engineer', ['Software Engineer']), true);
-  assert.equal(roleMatchesJobTitle('Graphic Designer', ['Software Engineer', 'Backend Developer']), false);
-  assert.equal(jobMatchesProfile(
-    { title: 'Senior Backend Software Engineer', company: 'Acme Labs' },
-    { role: 'Software Engineer', alternate_job_roles: ['Backend Developer'], exclude_companies: [] }
-  ), true);
-});
-
-test('rejects excluded companies case-insensitively', () => {
-  assert.equal(companyIsExcluded('Acme Labs, Inc.', ['acme labs']), true);
-  assert.equal(jobMatchesProfile(
-    { title: 'Software Engineer', company: 'Acme Labs' },
-    { role: 'Software Engineer', alternate_job_roles: [], exclude_companies: ['ACME LABS'] }
-  ), false);
-});
-</file>
-
-<file path=".env.example">
-DATABASE_URL=postgresql://user:password@azure-host:5432/database?sslmode=require
-DATABASE_SSL_REJECT_UNAUTHORIZED=false
-DATABASE_POOL_MAX=10
-PORT=3000
-
-BOT_TOKEN=
-CHAT_ID=
-DICE_PASSWORD=
-SENDGRID_API_KEY=
-SENDER_EMAIL=noreply@applywizz.com
-BROWSERBASE_API_KEY=
-BROWSERBASE_PROJECT_ID=
-BROWSERBASE_MAX_CONCURRENT=1
-USE_BROWSERBASE=false
-</file>
-
-<file path="link_telegram.html">
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <style>
-    body {
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      min-height: 100vh;
-      margin: 0;
-      background-color: #f0f4f8;
-      font-family: sans-serif;
-    }
-
-    /* Container controlling the vertical layout */
-    .card {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 24px;
-    }
-
-    .btn {
-      background-color: #0088cc;
-      color: white;
-      padding: 12px 24px;
-      border-radius: 6px;
-      text-decoration: none;
-      font-weight: bold;
-    }
-
-    .qr-code {
-      width: 200px;
-      height: 200px;
-    }
-  </style>
-</head>
-<body>
-
-  <div class="card">
-    <!-- Button on Top -->
-    <a href="https://t.me/dice_apply_bot" class="btn">Chat with our Telegram Bot</a>
-    <centre>OR</centre>
-    Scan QR Code below:
-    <!-- QR Code Below -->
-    <img src="BotDice.png" alt="Telegram Bot QR Code" class="qr-code">
-  </div>
-
-</body>
-</html>
-</file>
-
-<file path="lib/apply-worker.js">
-const crypto = require('crypto');
-const { openBrowser, closeBrowser, useBrowserbase, maxConcurrent } = require('./browser');
-
-/**
- * Starts N workers that claim jobs from apply_queue and run the provided executor.
- * @param {object} options
- * @param {ReturnType<import('./apply-queue').createApplyQueue>} options.queue
- * @param {(job: object) => Promise<void>} options.executeJob
- * @param {(chatId: number, event: string, details?: object) => Promise<void>} [options.audit]
- * @param {number} [options.concurrency]
- * @param {number} [options.pollMs]
- */
-function startApplyWorkers({
-  queue,
-  executeJob,
-  audit = async () => {},
-  concurrency = maxConcurrent,
-  pollMs = 2000,
-}) {
-  const workerCount = Math.max(1, concurrency);
-  let stopping = false;
-  const loops = [];
-
-  async function workerLoop(workerId) {
-    console.log(`[queue-worker ${workerId}] started`);
-    while (!stopping) {
-      let job = null;
-      try {
-        job = await queue.claimNextJob(workerId);
-      } catch (error) {
-        console.error(`[queue-worker ${workerId}] claim failed:`, error.message);
-        await sleep(pollMs);
-        continue;
-      }
-
-      if (!job) {
-        await sleep(pollMs);
-        continue;
-      }
-
-      console.log(`[queue-worker ${workerId}] claimed ${job.id} chat=${job.telegram_chat_id}`);
-      await audit(Number(job.telegram_chat_id), 'queue_worker_claimed', {
-        queueId: job.id,
-        workerId,
-        availableAt: job.available_at || null,
-        claimedAt: new Date().toISOString(),
-      }).catch(() => {});
-      try {
-        await audit(Number(job.telegram_chat_id), 'automation_started', {
-          queueId: job.id,
-          workerId,
-          startedAt: new Date().toISOString(),
-        }).catch(() => {});
-        await executeJob(job);
-        await queue.markCompleted(job.id);
-        console.log(`[queue-worker ${workerId}] completed ${job.id}`);
-        await audit(Number(job.telegram_chat_id), 'automation_completed', {
-          queueId: job.id,
-          workerId,
-          completedAt: new Date().toISOString(),
-        }).catch(() => {});
-      } catch (error) {
-        console.error(`[queue-worker ${workerId}] job ${job.id} failed:`, error.message);
-        const result = await queue.markFailedOrRetry(
-          job.id,
-          error.message,
-          job.attempts,
-          job.max_attempts
-        );
-        if (result.retried) {
-          console.log(`[queue-worker ${workerId}] re-queued ${job.id} (attempt ${job.attempts}/${job.max_attempts})`);
-        }
-        await audit(Number(job.telegram_chat_id), 'automation_failed', {
-          queueId: job.id,
-          workerId,
-          failedAt: new Date().toISOString(),
-          error: error.message,
-          retried: result.retried,
-        }).catch(() => {});
-      }
-    }
-    console.log(`[queue-worker ${workerId}] stopped`);
-  }
-
-  for (let i = 0; i < workerCount; i += 1) {
-    const workerId = `worker-${i + 1}-${crypto.randomBytes(3).toString('hex')}`;
-    loops.push(workerLoop(workerId));
-  }
-
-  console.log(`[queue] ${workerCount} apply worker(s) running (poll ${pollMs}ms)`);
-
-  return {
-    stop() {
-      stopping = true;
-    },
-    done: Promise.all(loops),
-  };
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-module.exports = {
-  startApplyWorkers,
-  openBrowser,
-  closeBrowser,
-  useBrowserbase,
-};
-</file>
-
-<file path="lib/supabase.js">
-const { Pool } = require('pg');
-
-let pool;
-
-function requireDatabaseUrl() {
-  const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl) {
-    throw new Error('DATABASE_URL must be set for the Azure PostgreSQL database.');
-  }
-  return databaseUrl;
-}
-
-function createPool() {
-  if (!pool) {
-    pool = new Pool({
-      connectionString: requireDatabaseUrl(),
-      ssl: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED === 'false'
-        ? { rejectUnauthorized: false }
-        : undefined,
-      max: Number(process.env.DATABASE_POOL_MAX || 10),
-    });
-  }
-  return pool;
-}
-
-function assertIdentifier(value, label) {
-  if (!/^[a-z_][a-z0-9_]*$/i.test(value)) {
-    throw new Error(`Invalid ${label}: ${value}`);
-  }
-  return `"${value}"`;
-}
-
-function parseColumns(columns) {
-  if (!columns || columns === '*') return '*';
-  return columns.split(',').map((column) => {
-    const trimmed = column.trim();
-    if (trimmed === '*') return '*';
-    return assertIdentifier(trimmed, 'column');
-  }).join(', ');
-}
-
-function createQueryBuilder(tableName) {
-  const table = assertIdentifier(tableName, 'table');
-  const state = {
-    operation: null,
-    columns: '*',
-    values: null,
-    filters: [],
-    orderBy: null,
-    returnRows: false,
-    count: false,
-    head: false,
-    conflict: null,
-  };
-
-  function addFilter(sql, value) {
-    state.filters.push({ sql, value });
-    return builder;
-  }
-
-  function buildWhere(parameters) {
-    if (state.filters.length === 0) return '';
-    const clauses = state.filters.map((filter) => {
-      if (filter.values) {
-        const placeholders = filter.values.map((value) => {
-          parameters.push(value);
-          return `$${parameters.length}`;
-        }).join(', ');
-        return filter.sql.replace('?', placeholders);
-      }
-      if (filter.value === undefined) return filter.sql;
-      parameters.push(filter.value);
-      return filter.sql.replace('?', `$${parameters.length}`);
-    });
-    return ` where ${clauses.join(' and ')}`;
-  }
-
-  async function execute() {
-    const parameters = [];
-    let text;
-
-    if (state.operation === 'select') {
-      const selected = state.head ? '1' : state.columns;
-      text = `select ${selected} from ${table}${buildWhere(parameters)}`;
-      if (state.orderBy) {
-        text += ` order by ${assertIdentifier(state.orderBy.column, 'order column')} ${state.orderBy.ascending ? 'asc' : 'desc'}`;
-      }
-    } else if (state.operation === 'insert' || state.operation === 'upsert') {
-      const rows = Array.isArray(state.values) ? state.values : [state.values];
-      if (rows.length === 0) throw new Error('Cannot insert an empty list.');
-      const columns = Object.keys(rows[0]);
-      const columnSql = columns.map((column) => assertIdentifier(column, 'column')).join(', ');
-      const rowSql = rows.map((row) => `(${columns.map((column) => {
-        parameters.push(row[column]);
-        return `$${parameters.length}`;
-      }).join(', ')})`).join(', ');
-      text = `insert into ${table} (${columnSql}) values ${rowSql}`;
-      if (state.operation === 'upsert') {
-        if (state.conflict) {
-          const conflictColumns = state.conflict.split(',').map((column) => assertIdentifier(column.trim(), 'conflict column')).join(', ');
-          text += ` on conflict (${conflictColumns}) do update set ${columns.map((column) => {
-            const identifier = assertIdentifier(column, 'column');
-            return `${identifier} = excluded.${identifier}`;
-          }).join(', ')}`;
-        } else {
-          text += ` on conflict do update set ${columns.map((column) => {
-            const identifier = assertIdentifier(column, 'column');
-            return `${identifier} = excluded.${identifier}`;
-          }).join(', ')}`;
-        }
-      }
-      if (state.returnRows) text += ` returning ${state.columns}`;
-    } else if (state.operation === 'update') {
-      const columns = Object.keys(state.values || {});
-      text = `update ${table} set ${columns.map((column) => {
-        parameters.push(state.values[column]);
-        return `${assertIdentifier(column, 'column')} = $${parameters.length}`;
-      }).join(', ')}${buildWhere(parameters)}`;
-      if (state.returnRows) text += ` returning ${state.columns}`;
-    } else if (state.operation === 'delete') {
-      text = `delete from ${table}${buildWhere(parameters)}`;
-      if (state.returnRows) text += ` returning ${state.columns}`;
-    } else {
-      throw new Error('A database operation was not selected.');
-    }
-
-    const result = await createPool().query(text, parameters);
-    if (state.head) return { data: null, error: null, count: result.rowCount };
-    const rows = result.rows;
-    if (state.singleMode && rows.length > 1) {
-      return {
-        data: null,
-        error: new Error('Expected one row, got multiple.'),
-      };
-    }
-    return {
-      data: state.singleMode ? (rows[0] || null) : (state.returnRows || state.operation === 'select' ? rows : null),
-      error: null,
-      count: state.operation === 'select' ? result.rowCount : undefined,
-    };
-  }
-
-  const builder = {
-    select(columns = '*', options = {}) {
-      if (!state.operation) state.operation = 'select';
-      state.columns = parseColumns(columns);
-      state.returnRows = state.operation !== 'select' || state.returnRows;
-      state.count = options.count === 'exact';
-      state.head = options.head === true;
-      return builder;
-    },
-    insert(values) {
-      state.operation = 'insert';
-      state.values = values;
-      return builder;
-    },
-    upsert(values, options = {}) {
-      state.operation = 'upsert';
-      state.values = values;
-      state.conflict = options.onConflict || null;
-      return builder;
-    },
-    update(values) {
-      state.operation = 'update';
-      state.values = values;
-      return builder;
-    },
-    delete() {
-      state.operation = 'delete';
-      return builder;
-    },
-    eq(column, value) {
-      return addFilter(`${assertIdentifier(column, 'filter column')} = ?`, value);
-    },
-    in(column, values) {
-      state.filters.push({
-        sql: `${assertIdentifier(column, 'filter column')} in (?)`,
-        values,
-      });
-      return builder;
-    },
-    is(column, value) {
-      if (value !== null) throw new Error('Only null is supported by is().');
-      return addFilter(`${assertIdentifier(column, 'filter column')} is null`);
-    },
-    order(column, options = {}) {
-      state.orderBy = { column, ascending: options.ascending !== false };
-      return builder;
-    },
-    maybeSingle() {
-      state.singleMode = true;
-      return execute();
-    },
-    single() {
-      state.singleMode = true;
-      return execute();
-    },
-  };
-
-  builder.then = (resolve, reject) => execute().then(resolve, reject);
-  builder.catch = (reject) => execute().catch(reject);
-  builder.finally = (callback) => execute().finally(callback);
-  return builder;
-}
-
-function createServiceClient() {
-  return {
-    from(table) {
-      return createQueryBuilder(table);
-    },
-    async rpc(functionName, args = {}) {
-      const fn = assertIdentifier(functionName, 'function');
-      const keys = Object.keys(args);
-      const values = keys.map((key) => args[key]);
-      const placeholders = keys.map((key, index) => `$${index + 1}`).join(', ');
-      const result = await createPool().query(`select * from public.${fn}(${placeholders})`, values);
-      return { data: result.rows, error: null };
-    },
-  };
-}
-
-module.exports = {
-  createPool,
-  createServiceClient,
-};
-</file>
-
-<file path="lib/workflow-state.js">
-function createWorkflowStateStore(supabase) {
-  async function get(chatId) {
-    const { data, error } = await supabase
-      .from('workflow_sessions')
-      .select('*')
-      .eq('telegram_chat_id', chatId)
-      .maybeSingle();
-    if (error) throw new Error(`Workflow state lookup failed: ${error.message}`);
-    return data;
-  }
-
-  async function save(chatId, changes) {
-    const { data, error } = await supabase
-      .from('workflow_sessions')
-      .upsert({ telegram_chat_id: chatId, ...changes }, { onConflict: 'telegram_chat_id' })
-      .select('*')
-      .single();
-    if (error) throw new Error(`Workflow state save failed: ${error.message}`);
-    return data;
-  }
-
-  async function recordPrompt(chatId, prompt) {
-    const { error } = await supabase.from('workflow_prompt_events').insert({
-      telegram_chat_id: chatId,
-      prompt_token: prompt.token,
-      url: prompt.url,
-      sent_at: new Date(prompt.sentAt).toISOString(),
-      expires_at: new Date(prompt.expiresAt).toISOString(),
-    });
-    if (error) throw new Error(`Workflow prompt save failed: ${error.message}`);
-  }
-
-  async function recordDecision(chatId, token, decision, clickedAt) {
-    const { data, error } = await supabase
-      .from('workflow_prompt_events')
-      .update({ decision, clicked_at: new Date(clickedAt).toISOString() })
-      .eq('telegram_chat_id', chatId)
-      .eq('prompt_token', token)
-      .is('decision', null)
-      .select('id')
-      .maybeSingle();
-    if (error) throw new Error(`Workflow decision save failed: ${error.message}`);
-    return Boolean(data);
-  }
-
-  async function log(chatId, event, details = {}) {
-    const { error } = await supabase.from('workflow_audit_logs').insert({
-      telegram_chat_id: chatId,
-      event,
-      details,
-    });
-    if (error) console.error(`Workflow audit log failed (${event}):`, error.message);
-  }
-
-  return { get, save, recordPrompt, recordDecision, log };
-}
-
-module.exports = { createWorkflowStateStore };
-</file>
-
-<file path="public/dashboard.js">
-const state = { timer: null, data: null };
-const dateInput = document.querySelector('#date');
-const timezoneInput = document.querySelector('#timezone');
-const statusText = document.querySelector('#status');
-const summary = document.querySelector('#summary');
-const users = document.querySelector('#users');
-const loginPanel = document.querySelector('#login');
-
-const today = new Date();
-dateInput.value = [today.getFullYear(), String(today.getMonth() + 1).padStart(2, '0'), String(today.getDate()).padStart(2, '0')].join('-');
-
-dateInput.addEventListener('change', loadDashboard);
-timezoneInput.addEventListener('change', loadDashboard);
-document.querySelector('#logout').addEventListener('click', async () => {
-  await fetch('/api/auth/logout', { method: 'POST' });
-  showLogin();
-});
-document.querySelector('#login-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const error = document.querySelector('#login-error');
-  error.textContent = '';
-  const response = await fetch('/api/auth/login', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      email: document.querySelector('#email').value,
-      password: document.querySelector('#password').value,
-    }),
-  });
-  if (!response.ok) {
-    error.textContent = (await response.json()).error || 'Sign in failed.';
-    return;
-  }
-  await loadDashboard();
-});
-
-async function loadDashboard() {
-  const params = new URLSearchParams({ date: dateInput.value, timezone: timezoneInput.value });
-  const response = await fetch(`/api/dashboard?${params}`);
-  if (response.status === 401) return showLogin();
-  if (!response.ok) {
-    statusText.textContent = 'Dashboard data could not be loaded.';
-    return;
-  }
-  state.data = await response.json();
-  render(state.data);
-  startPolling();
-}
-
-function render(data) {
-  loginPanel.hidden = true;
-  users.hidden = false;
-  const active = data.users.filter((user) => user.has_activity).length;
-  summary.textContent = `${data.users.length} users · ${active} active · refreshed ${new Date().toLocaleTimeString()}`;
-  statusText.textContent = `${data.date} · ${data.timezone}`;
-  users.innerHTML = data.users.map(renderUser).join('');
-  startTimers();
-}
-
-function renderUser(user) {
-  const label = escapeHtml(user.full_name || user.company_email || `Telegram ${user.telegram_chat_id}`);
-  const email = escapeHtml(user.company_email || `Telegram ${user.telegram_chat_id}`);
-  const session = user.session;
-  const logs = user.audit_logs.map((row) => ({ time: row.created_at, type: row.event, details: row.details }));
-  user.prompt_events.forEach((row) => logs.push({ time: row.sent_at, type: `prompt: ${row.decision || 'waiting'}`, details: { url: row.url, expires_at: row.expires_at, clicked_at: row.clicked_at } }));
-  user.applications.forEach((row) => logs.push({ time: row.applied_at, type: `application: ${row.status}`, details: { job_name: row.job_name, url: row.url } }));
-  user.queue.forEach((row) => logs.push({ time: row.created_at, type: `queue: ${row.status}`, details: { url: row.url, available_at: row.available_at, started_at: row.started_at, finished_at: row.finished_at } }));
-  logs.sort((left, right) => new Date(left.time) - new Date(right.time));
-  const logHtml = logs.length ? logs.map((log) => `<div class="log"><time>${formatTime(log.time)}</time><div><strong>${escapeHtml(log.type)}</strong><pre>${escapeHtml(JSON.stringify(log.details || {}, null, 2))}</pre></div></div>`).join('') : '<p class="muted">No activity for this date.</p>';
-  const timer = session ? `<div class="timer"><div class="metric"><strong>${formatTime(session.session_started_at)}</strong><span>9-hour window start</span></div><div class="metric"><strong>${formatTime(session.session_deadline)}</strong><span>window deadline</span></div><div class="metric"><strong data-countdown="${escapeHtml(session.session_deadline || '')}">${remaining(session.session_deadline)}</strong><span>window remaining</span></div><div class="metric"><strong>${formatTime(session.next_scan_at)}</strong><span>next link</span></div></div>` : '<p class="muted">No workflow session recorded for this date.</p>';
-  return `<details class="user"><summary><span class="user-name">${label}</span><span class="user-email">${email}</span><span class="badge ${user.has_activity ? '' : 'idle'}">${user.has_activity ? `${logs.length} events` : 'No activity'}</span></summary><div class="user-body">${timer}<div class="columns"><section class="panel"><h3>Timeline</h3>${logHtml}</section><section class="panel"><h3>Current status</h3>${renderCurrent(user)}</section></div></div></details>`;
-}
-
-function renderCurrent(user) {
-  const latest = user.applications[user.applications.length - 1];
-  if (!latest) return '<p class="muted">No application status recorded.</p>';
-  return `<div class="metric"><strong>${escapeHtml(latest.status)}</strong><span>${escapeHtml(latest.job_name || latest.url || 'Current job')}</span></div>`;
-}
-
-function showLogin() {
-  if (state.timer) clearInterval(state.timer);
-  loginPanel.hidden = false;
-  users.hidden = true;
-  statusText.textContent = 'Sign in to view workflow activity.';
-}
-
-function startPolling() {
-  if (state.timer) return;
-  state.timer = setInterval(loadDashboard, 30 * 60 * 1000);
-}
-
-function startTimers() {
-  if (state.countdownTimer) clearInterval(state.countdownTimer);
-  state.countdownTimer = setInterval(() => {
-    document.querySelectorAll('[data-countdown]').forEach((element) => {
-      element.textContent = remaining(element.dataset.countdown);
-    });
-  }, 1000);
-}
-
-function remaining(deadline) {
-  const seconds = Math.max(0, Math.floor((new Date(deadline).getTime() - Date.now()) / 1000));
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  const remainder = seconds % 60;
-  return `${hours}h ${String(minutes).padStart(2, '0')}m ${String(remainder).padStart(2, '0')}s`;
-}
-
-function formatTime(value) {
-  if (!value) return '—';
-  return new Date(value).toLocaleString();
-}
-
-function escapeHtml(value) {
-  return String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
-}
-
-loadDashboard();
-</file>
-
-<file path=".dockerignore">
-node_modules
-.env
-.env.*
-.git
-.gitignore
-*.log
-</file>
-
-<file path=".gitignore">
-.env
-node_modules/
-</file>
-
-<file path="Dockerfile">
-FROM node:22-bookworm
-
-WORKDIR /app
-
-COPY package*.json ./
-
-RUN npm install --omit=dev
-RUN npx playwright install --with-deps chromium
-
-COPY . .
-
-ENV NODE_ENV=production
-
-CMD ["node", "index.js"]
-</file>
-
-<file path="package.json">
-{
-  "scripts": {
-    "create-operator": "node scripts/create-operator.js",
-    "import-clients": "node scripts/import-clients.js",
-    "start": "node index.js",
-    "test": "node --test test/*.test.js",
-    "verify-client": "node scripts/verify-client-lookup.js",
-    "smoke-browserbase": "node scripts/smoke-browserbase.js"
-  },
-  "dependencies": {
-    "@browserbasehq/sdk": "^2.19.0",
-    "@sendgrid/mail": "^8.1.6",
-    "bcryptjs": "^3.0.3",
-    "dotenv": "^17.4.2",
-    "node-telegram-bot-api": "^2.1.0",
-    "pg": "^8.23.0",
-    "playwright": "^1.62.1",
-    "playwright-core": "^1.62.1"
-  }
-}
-</file>
-
-<file path="lib/browser.js">
-const { chromium: localChromium } = require('playwright');
-const { chromium: remoteChromium } = require('playwright-core');
-const Browserbase = require('@browserbasehq/sdk');
-
-function envFlag(name, defaultValue = false) {
-  const raw = process.env[name];
-  if (raw == null || raw === '') return defaultValue;
-  return String(raw).split('#')[0].trim().toLowerCase() === 'true';
-}
-
-function envInt(name, defaultValue) {
-  const raw = process.env[name];
-  if (raw == null || raw === '') return defaultValue;
-  const value = Number(String(raw).split('#')[0].trim());
-  return Number.isFinite(value) && value > 0 ? value : defaultValue;
-}
-
-const useBrowserbase = envFlag('USE_BROWSERBASE', false);
-const maxConcurrent = envInt('BROWSERBASE_MAX_CONCURRENT', 20);
-
-let bbClient = null;
-let activeSessions = 0;
-const waitQueue = [];
-
-function getBrowserbase() {
-  if (!bbClient) {
-    const apiKey = process.env.BROWSERBASE_API_KEY;
-    if (!apiKey) {
-      throw new Error('BROWSERBASE_API_KEY must be set when USE_BROWSERBASE=true.');
-    }
-    bbClient = new Browserbase({ apiKey });
-  }
-  return bbClient;
-}
-
-function acquireSlot() {
-  if (activeSessions < maxConcurrent) {
-    activeSessions += 1;
-    return Promise.resolve();
-  }
-  return new Promise((resolve) => {
-    waitQueue.push(resolve);
-  }).then(() => {
-    activeSessions += 1;
-  });
-}
-
-function releaseSlot() {
-  activeSessions = Math.max(0, activeSessions - 1);
-  const next = waitQueue.shift();
-  if (next) next();
-}
-
-async function openLocalBrowser({ storageState = null, headless = true } = {}) {
-  const browser = await localChromium.launch({
-    headless: true,
-  });
-  const context = await browser.newContext(storageState ? { storageState } : undefined);
-  const page = await context.newPage();
-  return {
-    browser,
-    context,
-    page,
-    sessionId: null,
-    provider: 'local',
-  };
-}
-
-async function openBrowserbaseBrowser({ storageState = null } = {}) {
-  await acquireSlot();
-  let browser = null;
-  try {
-    const bb = getBrowserbase();
-    const projectId = (process.env.BROWSERBASE_PROJECT_ID || '').split('#')[0].trim();
-    if (!projectId) {
-      throw new Error(
-        'BROWSERBASE_PROJECT_ID must be set when USE_BROWSERBASE=true. Find it in Browserbase Settings.'
-      );
-    }
-
-    const session = await bb.sessions.create({ projectId });
-    console.log(`[browser] Browserbase session created: ${session.id}`);
-    console.log(`[browser] Replay: https://www.browserbase.com/sessions/${session.id}`);
-
-    const connectUrl = session.connectUrl || session.connect_url;
-    if (!connectUrl) {
-      throw new Error('Browserbase session response did not include connectUrl.');
-    }
-
-    browser = await remoteChromium.connectOverCDP(connectUrl);
-
-    let context;
-    if (storageState) {
-      context = await browser.newContext({ storageState });
-    } else {
-      context = browser.contexts()[0] || await browser.newContext();
-    }
-
-    const page = context.pages()[0] || await context.newPage();
-    return {
-      browser,
-      context,
-      page,
-      sessionId: session.id,
-      provider: 'browserbase',
-    };
-  } catch (error) {
-    if (browser) await browser.close().catch(() => {});
-    releaseSlot();
-    throw error;
-  }
-}
-
-/**
- * Opens a browser either on Browserbase or locally based on USE_BROWSERBASE.
- * @param {{ storageState?: object|null, headless?: boolean }} options
- */
-async function openBrowser(options = {}) {
-  if (useBrowserbase) {
-    return openBrowserbaseBrowser(options);
-  }
-  return openLocalBrowser(options);
-}
-
-async function closeBrowser(handle) {
-  if (!handle) return;
-  try {
-    if (handle.context) await handle.context.close().catch(() => {});
-  } finally {
-    try {
-      if (handle.browser) await handle.browser.close().catch(() => {});
-    } finally {
-      if (handle.provider === 'browserbase') releaseSlot();
-    }
-  }
-}
-
-module.exports = {
-  openBrowser,
-  closeBrowser,
-  useBrowserbase,
-  maxConcurrent,
-};
-</file>
-
-<file path="lib/dice-apply-questions.js">
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function normalizeText(value) {
-  return String(value || '').replace(/\s+/g, ' ').trim();
-}
-
-function yesNoFromBoolean(value) {
-  if (value === true) return 'Yes';
-  if (value === false) return 'No';
-  return null;
-}
-
-function pickAllOptions(options, wantedList) {
-  const chosen = [];
-  for (const wanted of wantedList) {
-    const match = pickOption(options, wanted);
-    if (match && !chosen.includes(match)) chosen.push(match);
-  }
-  return chosen;
-}
-
-function answersToList(answer) {
-  if (answer == null || answer === '') return [];
-  if (Array.isArray(answer)) return answer.map((item) => String(item).trim()).filter(Boolean);
-  return String(answer).split(',').map((item) => item.trim()).filter(Boolean);
-}
-
-function ruleAnswerMulti(question, options, profile) {
-  const single = ruleAnswer(question, options, profile);
-  if (single) return answersToList(single);
-
-  const roleHints = [
-    ...(Array.isArray(profile.job_role_preferences) ? profile.job_role_preferences : []),
-    ...answersToList(profile.alternate_job_roles),
-    ...(Array.isArray(profile.add_ons_info) ? profile.add_ons_info : []),
-  ];
-  const fromProfile = pickAllOptions(options, roleHints);
-  return fromProfile.length ? fromProfile : null;
-}
-
-function pickOption(options, wanted) {
-  if (!wanted) return null;
-  const wantedLower = String(wanted).trim().toLowerCase();
-  return options.find((option) => option.toLowerCase() === wantedLower)
-    || options.find((option) => option.toLowerCase().includes(wantedLower))
-    || null;
-}
-
-async function answerWithLlm(/* { question, options, type, profile } */) {
-  console.log('[LLM placeholder] No API configured; unmatched question will not be auto-answered.');
-  return { skip: true };
-}
-
-function ruleAnswer(question, options, profile) {
-  const q = question.toLowerCase();
-  const pickYesNo = (bool) => pickOption(options, yesNoFromBoolean(bool));
-
-  if (/office|on-site|onsite|come into the office|in the office|on site/.test(q)) {
-    return pickYesNo(profile.can_work_3_days_in_office);
-  }
-  if (/relocat/.test(q)) {
-    return pickYesNo(profile.willing_to_relocate);
-  }
-  if (/sponsor/.test(q)) {
-    return pickYesNo(profile.require_future_sponsorship ?? profile.sponsorship);
-  }
-  if (/over 18|18 years/.test(q)) {
-    return pickYesNo(profile.is_over_18);
-  }
-  if (/eligible to work in the (united states|u\.?s\.?)/.test(q) || /authorized to work in the (united states|u\.?s\.?)/.test(q)) {
-    return pickYesNo(profile.eligible_to_work_in_us);
-  }
-  if (/authorized without (a )?visa|without visa sponsorship/.test(q)) {
-    return pickYesNo(profile.authorized_without_visa);
-  }
-  if (/background check/.test(q)) {
-    return pickYesNo(profile.willing_background_check);
-  }
-  if (/drug (screen|test)/.test(q)) {
-    return pickYesNo(profile.willing_drug_screen);
-  }
-  if (/felony|convicted/.test(q)) {
-    return pickYesNo(profile.convicted_of_felony);
-  }
-  if (/perform essential functions|essential (job )?functions/.test(q)) {
-    return pickYesNo(profile.can_perform_essential_functions);
-  }
-  if (/years of experience|how many years/.test(q) && options.length === 0) {
-    return profile.experience ? String(profile.experience) : null;
-  }
-  if (/highest (level of )?education|education level/.test(q)) {
-    return pickOption(options, profile.highest_education) || (options.length ? null : profile.highest_education);
-  }
-  if (/when can you start|start date/.test(q) && options.length === 0) {
-    return profile.desired_start_date ? String(profile.desired_start_date) : null;
-  }
-
-  return null;
-}
-
-async function loadApplyProfile(supabase, clientId) {
-  if (!clientId) return {};
-
-  const { data: client, error: clientError } = await supabase
-    .from('clients')
-    .select('full_name, visa_type, sponsorship, job_role_preferences, applywizz_id, company_email')
-    .eq('id', clientId)
-    .maybeSingle();
-  if (clientError) console.error('Failed to load client for apply questions:', clientError.message);
-
-  const { data: profile, error: profileError } = await supabase
-    .from('client_profiles')
-    .select('can_work_3_days_in_office, willing_to_relocate, require_future_sponsorship, is_over_18, eligible_to_work_in_us, authorized_without_visa, willing_background_check, willing_drug_screen, convicted_of_felony, can_perform_essential_functions, experience, highest_education, desired_start_date, resume_url, add_ons_info, role, alternate_job_roles, exclude_companies')
-    .eq('id', clientId)
-    .maybeSingle();
-  if (profileError) console.error('Failed to load profile for apply questions:', profileError.message);
-
-  return {
-    ...(client || {}),
-    ...(profile || {}),
-    sponsorship: client?.sponsorship,
-  };
-}
-
-async function isResumeCoverStep(page) {
-  const heading = page.getByText(/resume\s*&\s*cover letter/i);
-  return (await heading.count()) > 0;
-}
-
-async function radioGroupAlreadyAnswered(group) {
-  const radios = group.locator('input[type="radio"]');
-  const count = await radios.count();
-  for (let i = 0; i < count; i += 1) {
-    if (await radios.nth(i).isChecked().catch(() => false)) return true;
-  }
-  return false;
-}
-
-async function readRadioQuestion(group) {
-  const slotLabel = normalizeText(await group.locator('[slot="label"]').first().innerText().catch(() => ''));
-  if (slotLabel) return slotLabel;
-
-  const labelledBy = await group.getAttribute('aria-labelledby');
-  if (labelledBy) {
-    const id = labelledBy.trim().split(/\s+/)[0];
-    const fromId = normalizeText(await group.page().locator(`[id="${id}"]`).innerText().catch(() => ''));
-    if (fromId) return fromId;
-  }
-
-  return normalizeText(await group.getAttribute('aria-label') || '');
-}
-
-async function optionLabelsFromGroup(group) {
-  const labels = group.locator('label');
-  const count = await labels.count();
-  const options = [];
-  for (let i = 0; i < count; i += 1) {
-    const text = normalizeText(await labels.nth(i).innerText().catch(() => ''));
-    if (text) options.push(text);
-  }
-  return options;
-}
-
-async function clickLabeledControl(group, optionText) {
-  const exact = new RegExp(`^${escapeRegExp(optionText)}$`, 'i');
-  const pressableExact = group.locator('label[data-react-aria-pressable="true"]').filter({ hasText: exact });
-  const pressableLoose = group.locator('label[data-react-aria-pressable="true"]').filter({ hasText: optionText });
-  const labelExact = group.locator('label').filter({ hasText: exact });
-  const byText = group.getByText(optionText, { exact: true });
-
-  let target = pressableExact;
-  if (await target.count() === 0) target = pressableLoose;
-  if (await target.count() === 0) target = labelExact;
-  if (await target.count() === 0) target = byText;
-
-  await target.first().scrollIntoViewIfNeeded();
-  await target.first().click();
-}
-
-function applyQuestionForm(page) {
-  const withStepButton = page.locator('form').filter({
-    has: page.getByRole('button', { name: /^(next|submit)$/i }),
-  });
-  return withStepButton.last();
-}
-
-async function fillRadioGroups(page, profile) {
-  const form = applyQuestionForm(page);
-  await form.getByRole('radiogroup').first().waitFor({ state: 'attached', timeout: 4000 }).catch(() => { });
-
-  let groups = form.getByRole('radiogroup');
-  let count = await groups.count();
-  if (count === 0) {
-    groups = form.locator('[role="radiogroup"]');
-    count = await groups.count();
-  }
-
-  const rawRadios = await form.locator('input[type="radio"]').count();
-  console.log('[apply-questions] radio scan', {
-    inForm: (await form.count()) > 0,
-    radiogroups: count,
-    rawRadioInputs: rawRadios,
-    officeDb: profile.can_work_3_days_in_office ?? null,
-    relocateDb: profile.willing_to_relocate ?? null,
-    sponsorshipDb: profile.require_future_sponsorship ?? profile.sponsorship ?? null,
-  });
-
-  for (let i = 0; i < count; i += 1) {
-    const group = groups.nth(i);
-    const already = await radioGroupAlreadyAnswered(group);
-    const question = await readRadioQuestion(group);
-    const options = await optionLabelsFromGroup(group);
-
-    console.log('[apply-questions] radio group', {
-      index: i,
-      question: question || '(empty)',
-      options,
-      alreadyAnswered: already,
-    });
-
-    if (already) continue;
-    if (!question || options.length === 0) {
-      return { ok: false, reason: `Found a radio group but could not read question/options (question="${question}")` };
-    }
-
-    const answer = ruleAnswer(question, options, profile);
-    console.log('[apply-questions] DB rule result', { question, answer: answer || '(no rule match)' });
-
-    let chosen = answer;
-    if (!chosen) {
-      const llm = await answerWithLlm({ question, options, type: 'radio', profile });
-      console.log('[apply-questions] LLM placeholder', llm);
-      if (llm?.skip || !llm?.answer) {
-        return { ok: false, reason: `Unanswered radio: ${question}` };
-      }
-      chosen = llm.answer;
-    }
-
-    const option = pickOption(options, chosen);
-    if (!option) {
-      return { ok: false, reason: `No matching radio option for: ${question}` };
-    }
-    console.log('[apply-questions] clicking radio', option);
-    await clickLabeledControl(group, option);
-  }
-
-  return { ok: true };
-}
-
-async function optionIsSelected(group, optionText) {
-  const exact = new RegExp(`^${escapeRegExp(optionText)}$`, 'i');
-  const label = group.locator('label').filter({ hasText: exact }).first();
-  if (await label.getAttribute('data-selected').catch(() => null) === 'true') return true;
-  return label.locator('input[type="checkbox"]').isChecked().catch(() => false);
-}
-
-async function collectCheckboxGroups(form) {
-  const byRole = form.locator('[role="group"]').filter({ has: form.locator('input[type="checkbox"]') });
-  const roleCount = await byRole.count();
-  if (roleCount > 0) {
-    const groups = [];
-    for (let i = 0; i < roleCount; i += 1) groups.push(byRole.nth(i));
-    return groups;
-  }
-
-  const boxes = form.locator('input[type="checkbox"]');
-  const boxCount = await boxes.count();
-  const seen = new Set();
-  const groups = [];
-  for (let i = 0; i < boxCount; i += 1) {
-    const name = (await boxes.nth(i).getAttribute('name')) || `__idx_${i}`;
-    if (seen.has(name)) continue;
-    seen.add(name);
-    const first = boxes.nth(i);
-    const ancestor = first.locator('xpath=ancestor::*[.//*[@slot="label"]][1]');
-    groups.push((await ancestor.count()) ? ancestor : first.locator('xpath=ancestor::div[1]'));
-  }
-  return groups;
-}
-
-async function fillCheckboxGroups(page, profile) {
-  const form = applyQuestionForm(page);
-  await form.locator('input[type="checkbox"]').first().waitFor({ state: 'attached', timeout: 2000 }).catch(() => { });
-
-  const groups = await collectCheckboxGroups(form);
-  const rawBoxes = await form.locator('input[type="checkbox"]').count();
-  console.log('[apply-questions] checkbox scan', {
-    inForm: (await form.count()) > 0,
-    checkboxGroups: groups.length,
-    rawCheckboxInputs: rawBoxes,
-    rolesDb: profile.job_role_preferences ?? null,
-    alternateRolesDb: profile.alternate_job_roles ?? null,
-  });
-
-  for (let i = 0; i < groups.length; i += 1) {
-    const group = groups[i];
-    const question = await readRadioQuestion(group);
-    const options = await optionLabelsFromGroup(group);
-
-    console.log('[apply-questions] checkbox group', {
-      index: i,
-      question: question || '(empty)',
-      options,
-    });
-
-    if (!question || options.length === 0) {
-      return { ok: false, reason: `Found a checkbox group but could not read question/options (question="${question}")` };
-    }
-
-    const answer = ruleAnswerMulti(question, options, profile);
-    console.log('[apply-questions] DB rule result', { question, answer: answer || '(no rule match)' });
-
-    let chosenList = answer;
-    if (!chosenList || !chosenList.length) {
-      const llm = await answerWithLlm({ question, options, type: 'checkbox', profile });
-      console.log('[apply-questions] LLM placeholder', llm);
-      if (llm?.skip || llm?.answer == null) {
-        return { ok: false, reason: `Unanswered checkbox: ${question}` };
-      }
-      chosenList = answersToList(llm.answer);
-    }
-
-    const toClick = pickAllOptions(options, chosenList);
-    if (!toClick.length) {
-      return { ok: false, reason: `No matching checkbox options for: ${question}` };
-    }
-
-    for (const option of toClick) {
-      if (await optionIsSelected(group, option)) {
-        console.log('[apply-questions] checkbox already selected', option);
-        continue;
-      }
-      console.log('[apply-questions] clicking checkbox', option);
-      await clickLabeledControl(group, option);
-    }
-  }
-
-  return { ok: true };
-}
-
-function looksLikeCoverLetter(text) {
-  return /cover letter/i.test(text);
-}
-
-async function readTextQuestion(field) {
-  const container = field.locator('xpath=ancestor::*[.//*[@slot="label"]][1]');
-  const slotLabel = normalizeText(await container.locator('[slot="label"]').first().innerText().catch(() => ''));
-  if (slotLabel) return slotLabel;
-
-  const labelledBy = await field.getAttribute('aria-labelledby');
-  if (labelledBy) {
-    const id = labelledBy.trim().split(/\s+/)[0];
-    const fromId = normalizeText(await field.page().locator(`[id="${id}"]`).innerText().catch(() => ''));
-    if (fromId) return fromId;
-  }
-
-  return normalizeText(await field.getAttribute('aria-label') || await field.getAttribute('placeholder') || '');
-}
-
-async function fillTextFields(page, profile) {
-  const form = applyQuestionForm(page);
-  await form.locator('textarea, input[type="text"]').first().waitFor({ state: 'attached', timeout: 2000 }).catch(() => { });
-
-  const fields = form.locator('textarea, input[type="text"]');
-  const count = await fields.count();
-  console.log('[apply-questions] text scan', {
-    inForm: (await form.count()) > 0,
-    textFields: count,
-    experienceDb: profile.experience ?? null,
-    startDateDb: profile.desired_start_date ?? null,
-  });
-
-  for (let i = 0; i < count; i += 1) {
-    const field = fields.nth(i);
-    if (!await field.isVisible().catch(() => false)) continue;
-    const current = normalizeText(await field.inputValue().catch(() => ''));
-    const question = await readTextQuestion(field);
-
-    console.log('[apply-questions] text field', {
-      index: i,
-      question: question || '(empty)',
-      alreadyFilled: Boolean(current),
-    });
-
-    if (current) continue;
-    if (looksLikeCoverLetter(question)) continue;
-    if (!question) {
-      return { ok: false, reason: 'Found a text field but could not read its question' };
-    }
-
-    const answer = ruleAnswer(question, [], profile);
-    console.log('[apply-questions] DB rule result', { question, answer: answer || '(no rule match)' });
-
-    let chosen = answer;
-    if (!chosen) {
-      const llm = await answerWithLlm({ question, options: [], type: 'text', profile });
-      console.log('[apply-questions] LLM placeholder', llm);
-      if (llm?.skip || !llm?.answer) {
-        const required = /required|\*/i.test(question);
-        if (required) return { ok: false, reason: `Unanswered text: ${question}` };
-        continue;
-      }
-      chosen = llm.answer;
-    }
-
-    console.log('[apply-questions] writing text', chosen);
-    await field.click();
-    await field.fill(String(chosen));
-  }
-
-  return { ok: true };
-}
-
-async function fillCurrentStep(page, profile) {
-  const resumeHeadingPresent = await isResumeCoverStep(page);
-  console.log('[apply-questions] fillCurrentStep', { resumeHeadingPresent });
-
-  const radioResult = await fillRadioGroups(page, profile);
-  if (!radioResult.ok) return radioResult;
-
-  const checkboxResult = await fillCheckboxGroups(page, profile);
-  if (!checkboxResult.ok) return checkboxResult;
-
-  if (resumeHeadingPresent) {
-    console.log('[apply-questions] skipping text/cover fields on resume step');
-    return { ok: true };
-  }
-
-  const textResult = await fillTextFields(page, profile);
-  if (!textResult.ok) return textResult;
-
-  return { ok: true };
-}
-
-async function isVisibleEnabled(locator) {
-  if (await locator.count() === 0) return false;
-  const button = locator.first();
-  if (!await button.isVisible().catch(() => false)) return false;
-  return button.isEnabled();
-}
-
-module.exports = {
-  answerWithLlm,
-  fillCurrentStep,
-  isVisibleEnabled,
-  loadApplyProfile,
-  ruleAnswer,
-};
-</file>
 
 <file path="data/sample-clients.json">
 [
@@ -3336,6 +1147,39 @@ module.exports = {
 ]
 </file>
 
+<file path="database/migrations/001_dashboard_operator.sql">
+create table if not exists public.operator_accounts (
+  id uuid primary key default gen_random_uuid(),
+  email text not null unique,
+  password_hash text not null,
+  disabled boolean not null default false,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.operator_sessions (
+  token_hash text primary key,
+  operator_id uuid not null references public.operator_accounts(id) on delete cascade,
+  expires_at timestamptz not null,
+  created_at timestamptz not null default now(),
+  revoked_at timestamptz
+);
+
+create index if not exists operator_sessions_active_idx
+  on public.operator_sessions (token_hash, expires_at)
+  where revoked_at is null;
+
+create index if not exists workflow_audit_logs_dashboard_idx
+  on public.workflow_audit_logs (created_at, telegram_chat_id);
+
+create index if not exists workflow_prompt_events_dashboard_idx
+  on public.workflow_prompt_events (sent_at, telegram_chat_id);
+</file>
+
+<file path="database/migrations/002_workflow_newday.sql">
+alter table if exists public.workflow_sessions
+  add column if not exists newday_requested_at timestamptz;
+</file>
+
 <file path="lib/apply-queue.js">
 /**
  * Durable apply queue backed by Supabase (table: apply_queue).
@@ -3526,6 +1370,2121 @@ module.exports = {
 };
 </file>
 
+<file path="lib/apply-worker.js">
+const crypto = require('crypto');
+const { openBrowser, closeBrowser, useBrowserbase, maxConcurrent } = require('./browser');
+
+/**
+ * Starts N workers that claim jobs from apply_queue and run the provided executor.
+ * @param {object} options
+ * @param {ReturnType<import('./apply-queue').createApplyQueue>} options.queue
+ * @param {(job: object) => Promise<void>} options.executeJob
+ * @param {(chatId: number, event: string, details?: object) => Promise<void>} [options.audit]
+ * @param {number} [options.concurrency]
+ * @param {number} [options.pollMs]
+ */
+function startApplyWorkers({
+  queue,
+  executeJob,
+  audit = async () => {},
+  concurrency = maxConcurrent,
+  pollMs = 2000,
+}) {
+  const workerCount = Math.max(1, concurrency);
+  let stopping = false;
+  const loops = [];
+
+  async function workerLoop(workerId) {
+    console.log(`[queue-worker ${workerId}] started`);
+    while (!stopping) {
+      let job = null;
+      try {
+        job = await queue.claimNextJob(workerId);
+      } catch (error) {
+        console.error(`[queue-worker ${workerId}] claim failed:`, error.message);
+        await sleep(pollMs);
+        continue;
+      }
+
+      if (!job) {
+        await sleep(pollMs);
+        continue;
+      }
+
+      console.log(`[queue-worker ${workerId}] claimed ${job.id} chat=${job.telegram_chat_id}`);
+      await audit(Number(job.telegram_chat_id), 'queue_worker_claimed', {
+        queueId: job.id,
+        workerId,
+        availableAt: job.available_at || null,
+        claimedAt: new Date().toISOString(),
+      }).catch(() => {});
+      try {
+        await audit(Number(job.telegram_chat_id), 'automation_started', {
+          queueId: job.id,
+          workerId,
+          startedAt: new Date().toISOString(),
+        }).catch(() => {});
+        await executeJob(job);
+        await queue.markCompleted(job.id);
+        console.log(`[queue-worker ${workerId}] completed ${job.id}`);
+        await audit(Number(job.telegram_chat_id), 'automation_completed', {
+          queueId: job.id,
+          workerId,
+          completedAt: new Date().toISOString(),
+        }).catch(() => {});
+      } catch (error) {
+        console.error(`[queue-worker ${workerId}] job ${job.id} failed:`, error.message);
+        const result = await queue.markFailedOrRetry(
+          job.id,
+          error.message,
+          job.attempts,
+          job.max_attempts
+        );
+        if (result.retried) {
+          console.log(`[queue-worker ${workerId}] re-queued ${job.id} (attempt ${job.attempts}/${job.max_attempts})`);
+        }
+        await audit(Number(job.telegram_chat_id), 'automation_failed', {
+          queueId: job.id,
+          workerId,
+          failedAt: new Date().toISOString(),
+          error: error.message,
+          retried: result.retried,
+        }).catch(() => {});
+      }
+    }
+    console.log(`[queue-worker ${workerId}] stopped`);
+  }
+
+  for (let i = 0; i < workerCount; i += 1) {
+    const workerId = `worker-${i + 1}-${crypto.randomBytes(3).toString('hex')}`;
+    loops.push(workerLoop(workerId));
+  }
+
+  console.log(`[queue] ${workerCount} apply worker(s) running (poll ${pollMs}ms)`);
+
+  return {
+    stop() {
+      stopping = true;
+    },
+    done: Promise.all(loops),
+  };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+module.exports = {
+  startApplyWorkers,
+  openBrowser,
+  closeBrowser,
+  useBrowserbase,
+};
+</file>
+
+<file path="lib/browser.js">
+const { chromium: localChromium } = require('playwright');
+const { chromium: remoteChromium } = require('playwright-core');
+const Browserbase = require('@browserbasehq/sdk');
+
+function envFlag(name, defaultValue = false) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return defaultValue;
+  return String(raw).split('#')[0].trim().toLowerCase() === 'true';
+}
+
+function envInt(name, defaultValue) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return defaultValue;
+  const value = Number(String(raw).split('#')[0].trim());
+  return Number.isFinite(value) && value > 0 ? value : defaultValue;
+}
+
+const useBrowserbase = envFlag('USE_BROWSERBASE', false);
+const maxConcurrent = envInt('BROWSERBASE_MAX_CONCURRENT', 20);
+
+let bbClient = null;
+let activeSessions = 0;
+const waitQueue = [];
+
+function getBrowserbase() {
+  if (!bbClient) {
+    const apiKey = process.env.BROWSERBASE_API_KEY;
+    if (!apiKey) {
+      throw new Error('BROWSERBASE_API_KEY must be set when USE_BROWSERBASE=true.');
+    }
+    bbClient = new Browserbase({ apiKey });
+  }
+  return bbClient;
+}
+
+function acquireSlot() {
+  if (activeSessions < maxConcurrent) {
+    activeSessions += 1;
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    waitQueue.push(resolve);
+  }).then(() => {
+    activeSessions += 1;
+  });
+}
+
+function releaseSlot() {
+  activeSessions = Math.max(0, activeSessions - 1);
+  const next = waitQueue.shift();
+  if (next) next();
+}
+
+async function openLocalBrowser({ storageState = null, headless = true } = {}) {
+  const browser = await localChromium.launch({
+    headless: true,
+  });
+  const context = await browser.newContext(storageState ? { storageState } : undefined);
+  const page = await context.newPage();
+  return {
+    browser,
+    context,
+    page,
+    sessionId: null,
+    provider: 'local',
+  };
+}
+
+async function openBrowserbaseBrowser({ storageState = null } = {}) {
+  await acquireSlot();
+  let browser = null;
+  try {
+    const bb = getBrowserbase();
+    const projectId = (process.env.BROWSERBASE_PROJECT_ID || '').split('#')[0].trim();
+    if (!projectId) {
+      throw new Error(
+        'BROWSERBASE_PROJECT_ID must be set when USE_BROWSERBASE=true. Find it in Browserbase Settings.'
+      );
+    }
+
+    const session = await bb.sessions.create({ projectId });
+    console.log(`[browser] Browserbase session created: ${session.id}`);
+    console.log(`[browser] Replay: https://www.browserbase.com/sessions/${session.id}`);
+
+    const connectUrl = session.connectUrl || session.connect_url;
+    if (!connectUrl) {
+      throw new Error('Browserbase session response did not include connectUrl.');
+    }
+
+    browser = await remoteChromium.connectOverCDP(connectUrl);
+
+    let context;
+    if (storageState) {
+      context = await browser.newContext({ storageState });
+    } else {
+      context = browser.contexts()[0] || await browser.newContext();
+    }
+
+    const page = context.pages()[0] || await context.newPage();
+    return {
+      browser,
+      context,
+      page,
+      sessionId: session.id,
+      provider: 'browserbase',
+    };
+  } catch (error) {
+    if (browser) await browser.close().catch(() => {});
+    releaseSlot();
+    throw error;
+  }
+}
+
+/**
+ * Opens a browser either on Browserbase or locally based on USE_BROWSERBASE.
+ * @param {{ storageState?: object|null, headless?: boolean }} options
+ */
+async function openBrowser(options = {}) {
+  if (useBrowserbase) {
+    return openBrowserbaseBrowser(options);
+  }
+  return openLocalBrowser(options);
+}
+
+async function closeBrowser(handle) {
+  if (!handle) return;
+  try {
+    if (handle.context) await handle.context.close().catch(() => {});
+  } finally {
+    try {
+      if (handle.browser) await handle.browser.close().catch(() => {});
+    } finally {
+      if (handle.provider === 'browserbase') releaseSlot();
+    }
+  }
+}
+
+module.exports = {
+  openBrowser,
+  closeBrowser,
+  useBrowserbase,
+  maxConcurrent,
+};
+</file>
+
+<file path="lib/dashboard-server.js">
+const http = require('http');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const bcrypt = require('bcryptjs');
+
+const DASHBOARD_TIMEZONES = {
+  browser: null,
+  UTC: 'UTC',
+  Pacific: 'America/Los_Angeles',
+  Mountain: 'America/Denver',
+  Central: 'America/Chicago',
+  Eastern: 'America/New_York',
+};
+const SESSION_DAYS = 7;
+const dashboardRoot = path.join(__dirname, '..', 'public');
+
+function createDashboardServer({ db }) {
+  return http.createServer(async (request, response) => {
+    try {
+      await routeRequest(request, response, db);
+    } catch (error) {
+      console.error('[dashboard] request failed:', error.message);
+      sendJson(response, 500, { error: 'Dashboard request failed.' });
+    }
+  });
+}
+
+async function routeRequest(request, response, db) {
+  const requestUrl = new URL(request.url, 'http://localhost');
+  const pathname = requestUrl.pathname;
+
+  if (request.method === 'GET' && pathname === '/dashboard') {
+    return sendFile(response, 'dashboard.html', 'text/html; charset=utf-8');
+  }
+  if (request.method === 'GET' && pathname === '/dashboard.js') {
+    return sendFile(response, 'dashboard.js', 'application/javascript; charset=utf-8');
+  }
+  if (request.method === 'GET' && pathname === '/dashboard.css') {
+    return sendFile(response, 'dashboard.css', 'text/css; charset=utf-8');
+  }
+  if (request.method === 'POST' && pathname === '/api/auth/login') {
+    return login(request, response, db);
+  }
+  if (request.method === 'POST' && pathname === '/api/auth/logout') {
+    return logout(request, response, db);
+  }
+  if (request.method === 'GET' && pathname === '/api/auth/session') {
+    return authenticate(request, response, db, () => sendJson(response, 200, { authenticated: true }));
+  }
+  if (request.method === 'GET' && pathname === '/api/dashboard') {
+    return authenticate(request, response, db, () => readDashboard(requestUrl, response, db));
+  }
+
+  sendJson(response, 404, { error: 'Not found.' });
+}
+
+async function login(request, response, db) {
+  const body = await readJson(request);
+  const email = String(body.email || '').trim().toLowerCase();
+  const password = String(body.password || '');
+  if (!email || !password) return sendJson(response, 400, { error: 'Email and password are required.' });
+
+  const result = await db.query(
+    `select id, email, password_hash
+       from operator_accounts
+      where lower(email) = $1 and disabled = false
+      limit 1`,
+    [email]
+  );
+  const account = result.rows[0];
+  if (!account || !await bcrypt.compare(password, account.password_hash)) {
+    return sendJson(response, 401, { error: 'Invalid credentials.' });
+  }
+
+  const rawToken = crypto.randomBytes(32).toString('hex');
+  const tokenHash = hashToken(rawToken);
+  await db.query(
+    `insert into operator_sessions (token_hash, operator_id, expires_at)
+     values ($1, $2, now() + ($3 * interval '1 day'))`,
+    [tokenHash, account.id, SESSION_DAYS]
+  );
+  setCookie(response, 'dashboard_session', rawToken, SESSION_DAYS * 24 * 60 * 60);
+  sendJson(response, 200, { authenticated: true, email: account.email });
+}
+
+async function logout(request, response, db) {
+  const token = readCookie(request, 'dashboard_session');
+  if (token) {
+    await db.query(
+      `update operator_sessions set revoked_at = now()
+        where token_hash = $1 and revoked_at is null`,
+      [hashToken(token)]
+    );
+  }
+  setCookie(response, 'dashboard_session', '', 0);
+  sendJson(response, 200, { authenticated: false });
+}
+
+async function authenticate(request, response, db, handler) {
+  const token = readCookie(request, 'dashboard_session');
+  if (!token) return sendJson(response, 401, { error: 'Authentication required.' });
+  const result = await db.query(
+    `select operator_id
+       from operator_sessions
+      where token_hash = $1
+        and revoked_at is null
+        and expires_at > now()
+      limit 1`,
+    [hashToken(token)]
+  );
+  if (!result.rows[0]) return sendJson(response, 401, { error: 'Authentication required.' });
+  return handler(result.rows[0].operator_id);
+}
+
+async function readDashboard(requestUrl, response, db) {
+  const date = requestUrl.searchParams.get('date');
+  const timezone = requestUrl.searchParams.get('timezone') || 'browser';
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '')) return sendJson(response, 400, { error: 'date must be YYYY-MM-DD.' });
+  if (!(timezone in DASHBOARD_TIMEZONES)) return sendJson(response, 400, { error: 'Unsupported timezone.' });
+
+  const timezoneName = timezone === 'browser'
+    ? requestUrl.searchParams.get('timezone_name')
+    : DASHBOARD_TIMEZONES[timezone];
+  if (!timezoneName || !isSupportedTimezone(timezoneName)) {
+    return sendJson(response, 400, { error: 'A valid browser timezone is required.' });
+  }
+
+  const zone = timezoneName;
+  const bounds = await db.query(
+    `select ($1::date::timestamp at time zone $2) as start_at,
+            (($1::date + interval '1 day')::timestamp at time zone $2) as end_at`,
+    [date, zone]
+  );
+  const { start_at: startAt, end_at: endAt } = bounds.rows[0];
+
+  const [users, sessions, audits, prompts, applications, queue] = await Promise.all([
+    db.query(`
+      select distinct on (ds.telegram_chat_id)
+        ds.telegram_chat_id, ds.client_id, c.full_name, c.company_email, c.applywizz_id
+      from dice_sessions ds
+      left join clients c on c.id = ds.client_id
+      order by ds.telegram_chat_id, ds.updated_at desc nulls last`),
+    db.query(`
+      select telegram_chat_id, session_started_at, session_deadline, next_scan_at,
+             last_decision, last_decision_at, current_prompt_url,
+             current_prompt_sent_at, current_prompt_expires_at
+      from workflow_sessions
+      where session_started_at < $2 and coalesce(session_deadline, session_started_at) >= $1`, [startAt, endAt]),
+    db.query(`
+      select id, telegram_chat_id, event, details, created_at
+      from workflow_audit_logs
+      where created_at >= $1 and created_at < $2
+      order by created_at asc, id asc`, [startAt, endAt]),
+    db.query(`
+      select id, telegram_chat_id, prompt_token, url, sent_at, expires_at,
+             decision, clicked_at
+      from workflow_prompt_events
+      where sent_at >= $1 and sent_at < $2
+      order by sent_at asc, id asc`, [startAt, endAt]),
+    db.query(`
+      select id, client_id, telegram_chat_id, job_id, url, job_name, status, applied_at
+      from applications
+      where applied_at >= $1 and applied_at < $2
+      order by applied_at asc, id asc`, [startAt, endAt]),
+    db.query(`
+      select id, client_id, telegram_chat_id, job_id, url, status, available_at,
+             created_at, started_at, finished_at, attempts, max_attempts, last_error
+      from apply_queue
+      where created_at >= $1 and created_at < $2
+      order by created_at asc, id asc`, [startAt, endAt]),
+  ]);
+
+  const userMap = new Map(users.rows.map((user) => [String(user.telegram_chat_id), {
+    ...user,
+    has_activity: false,
+    session: sessions.rows.find((row) => String(row.telegram_chat_id) === String(user.telegram_chat_id)) || null,
+    audit_logs: [],
+    prompt_events: [],
+    applications: [],
+    queue: [],
+  }]));
+  const ensureUser = (chatId) => {
+    const key = String(chatId);
+    if (!userMap.has(key)) userMap.set(key, {
+      telegram_chat_id: chatId,
+      full_name: null,
+      company_email: null,
+      applywizz_id: null,
+      has_activity: false,
+      session: null,
+      audit_logs: [],
+      prompt_events: [],
+      applications: [],
+      queue: [],
+    });
+    return userMap.get(key);
+  };
+
+  audits.rows.forEach((row) => { const user = ensureUser(row.telegram_chat_id); user.audit_logs.push(row); user.has_activity = true; });
+  prompts.rows.forEach((row) => { const user = ensureUser(row.telegram_chat_id); user.prompt_events.push(row); user.has_activity = true; });
+  applications.rows.forEach((row) => { const user = ensureUser(row.telegram_chat_id); user.applications.push(row); user.has_activity = true; });
+  queue.rows.forEach((row) => { const user = ensureUser(row.telegram_chat_id); user.queue.push(row); user.has_activity = true; });
+
+  sendJson(response, 200, {
+    date,
+    timezone,
+    timezone_name: timezoneName,
+    start_at: startAt,
+    end_at: endAt,
+    users: [...userMap.values()].sort((left, right) => String(left.full_name || left.company_email || left.telegram_chat_id).localeCompare(String(right.full_name || right.company_email || right.telegram_chat_id))),
+  });
+}
+
+function isSupportedTimezone(timezoneName) {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezoneName }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readJson(request) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    request.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > 1024 * 1024) reject(new Error('Request body is too large.'));
+    });
+    request.on('end', () => {
+      try { resolve(body ? JSON.parse(body) : {}); } catch (error) { reject(new Error('Invalid JSON body.')); }
+    });
+    request.on('error', reject);
+  });
+}
+
+function sendFile(response, fileName, contentType) {
+  const filePath = path.join(dashboardRoot, fileName);
+  if (!fs.existsSync(filePath)) return sendJson(response, 404, { error: 'Dashboard asset not found.' });
+  response.writeHead(200, { 'content-type': contentType, 'cache-control': 'no-store' });
+  response.end(fs.readFileSync(filePath));
+}
+
+function sendJson(response, status, payload) {
+  response.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+  });
+  response.end(JSON.stringify(payload));
+}
+
+function hashToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function readCookie(request, name) {
+  const cookies = String(request.headers.cookie || '').split(';');
+  const item = cookies.find((cookie) => cookie.trim().startsWith(`${name}=`));
+  return item ? decodeURIComponent(item.trim().slice(name.length + 1)) : null;
+}
+
+function setCookie(response, name, value, maxAge) {
+  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  response.setHeader('set-cookie', `${name}=${encodeURIComponent(value)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`);
+}
+
+module.exports = {
+  createDashboardServer,
+  DASHBOARD_TIMEZONES,
+};
+</file>
+
+<file path="lib/dice-apply-questions.js">
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function yesNoFromBoolean(value) {
+  if (value === true) return 'Yes';
+  if (value === false) return 'No';
+  return null;
+}
+
+function pickAllOptions(options, wantedList) {
+  const chosen = [];
+  for (const wanted of wantedList) {
+    const match = pickOption(options, wanted);
+    if (match && !chosen.includes(match)) chosen.push(match);
+  }
+  return chosen;
+}
+
+function answersToList(answer) {
+  if (answer == null || answer === '') return [];
+  if (Array.isArray(answer)) return answer.map((item) => String(item).trim()).filter(Boolean);
+  return String(answer).split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function ruleAnswerMulti(question, options, profile) {
+  const single = ruleAnswer(question, options, profile);
+  if (single) return answersToList(single);
+
+  const roleHints = [
+    ...(Array.isArray(profile.job_role_preferences) ? profile.job_role_preferences : []),
+    ...answersToList(profile.alternate_job_roles),
+    ...(Array.isArray(profile.add_ons_info) ? profile.add_ons_info : []),
+  ];
+  const fromProfile = pickAllOptions(options, roleHints);
+  return fromProfile.length ? fromProfile : null;
+}
+
+function pickOption(options, wanted) {
+  if (!wanted) return null;
+  const wantedLower = String(wanted).trim().toLowerCase();
+  return options.find((option) => option.toLowerCase() === wantedLower)
+    || options.find((option) => option.toLowerCase().includes(wantedLower))
+    || null;
+}
+
+async function answerWithLlm(/* { question, options, type, profile } */) {
+  console.log('[LLM placeholder] No API configured; unmatched question will not be auto-answered.');
+  return { skip: true };
+}
+
+function ruleAnswer(question, options, profile) {
+  const q = question.toLowerCase();
+  const pickYesNo = (bool) => pickOption(options, yesNoFromBoolean(bool));
+
+  if (/office|on-site|onsite|come into the office|in the office|on site/.test(q)) {
+    return pickYesNo(profile.can_work_3_days_in_office);
+  }
+  if (/relocat/.test(q)) {
+    return pickYesNo(profile.willing_to_relocate);
+  }
+  if (/sponsor/.test(q)) {
+    return pickYesNo(profile.require_future_sponsorship ?? profile.sponsorship);
+  }
+  if (/over 18|18 years/.test(q)) {
+    return pickYesNo(profile.is_over_18);
+  }
+  if (/eligible to work in the (united states|u\.?s\.?)/.test(q) || /authorized to work in the (united states|u\.?s\.?)/.test(q)) {
+    return pickYesNo(profile.eligible_to_work_in_us);
+  }
+  if (/authorized without (a )?visa|without visa sponsorship/.test(q)) {
+    return pickYesNo(profile.authorized_without_visa);
+  }
+  if (/background check/.test(q)) {
+    return pickYesNo(profile.willing_background_check);
+  }
+  if (/drug (screen|test)/.test(q)) {
+    return pickYesNo(profile.willing_drug_screen);
+  }
+  if (/felony|convicted/.test(q)) {
+    return pickYesNo(profile.convicted_of_felony);
+  }
+  if (/perform essential functions|essential (job )?functions/.test(q)) {
+    return pickYesNo(profile.can_perform_essential_functions);
+  }
+  if (/years of experience|how many years/.test(q) && options.length === 0) {
+    return profile.experience ? String(profile.experience) : null;
+  }
+  if (/highest (level of )?education|education level/.test(q)) {
+    return pickOption(options, profile.highest_education) || (options.length ? null : profile.highest_education);
+  }
+  if (/when can you start|start date/.test(q) && options.length === 0) {
+    return profile.desired_start_date ? String(profile.desired_start_date) : null;
+  }
+
+  return null;
+}
+
+async function loadApplyProfile(supabase, clientId) {
+  if (!clientId) return {};
+
+  const { data: client, error: clientError } = await supabase
+    .from('clients')
+    .select('full_name, visa_type, sponsorship, job_role_preferences, applywizz_id, company_email')
+    .eq('id', clientId)
+    .maybeSingle();
+  if (clientError) console.error('Failed to load client for apply questions:', clientError.message);
+
+  const { data: profile, error: profileError } = await supabase
+    .from('client_profiles')
+    .select('can_work_3_days_in_office, willing_to_relocate, require_future_sponsorship, is_over_18, eligible_to_work_in_us, authorized_without_visa, willing_background_check, willing_drug_screen, convicted_of_felony, can_perform_essential_functions, experience, highest_education, desired_start_date, resume_url, add_ons_info, role, alternate_job_roles, exclude_companies')
+    .eq('id', clientId)
+    .maybeSingle();
+  if (profileError) console.error('Failed to load profile for apply questions:', profileError.message);
+
+  return {
+    ...(client || {}),
+    ...(profile || {}),
+    sponsorship: client?.sponsorship,
+  };
+}
+
+async function isResumeCoverStep(page) {
+  const heading = page.getByText(/resume\s*&\s*cover letter/i);
+  return (await heading.count()) > 0;
+}
+
+async function radioGroupAlreadyAnswered(group) {
+  const radios = group.locator('input[type="radio"]');
+  const count = await radios.count();
+  for (let i = 0; i < count; i += 1) {
+    if (await radios.nth(i).isChecked().catch(() => false)) return true;
+  }
+  return false;
+}
+
+async function readRadioQuestion(group) {
+  const slotLabel = normalizeText(await group.locator('[slot="label"]').first().innerText().catch(() => ''));
+  if (slotLabel) return slotLabel;
+
+  const labelledBy = await group.getAttribute('aria-labelledby');
+  if (labelledBy) {
+    const id = labelledBy.trim().split(/\s+/)[0];
+    const fromId = normalizeText(await group.page().locator(`[id="${id}"]`).innerText().catch(() => ''));
+    if (fromId) return fromId;
+  }
+
+  return normalizeText(await group.getAttribute('aria-label') || '');
+}
+
+async function optionLabelsFromGroup(group) {
+  const labels = group.locator('label');
+  const count = await labels.count();
+  const options = [];
+  for (let i = 0; i < count; i += 1) {
+    const text = normalizeText(await labels.nth(i).innerText().catch(() => ''));
+    if (text) options.push(text);
+  }
+  return options;
+}
+
+async function clickLabeledControl(group, optionText) {
+  const exact = new RegExp(`^${escapeRegExp(optionText)}$`, 'i');
+  const pressableExact = group.locator('label[data-react-aria-pressable="true"]').filter({ hasText: exact });
+  const pressableLoose = group.locator('label[data-react-aria-pressable="true"]').filter({ hasText: optionText });
+  const labelExact = group.locator('label').filter({ hasText: exact });
+  const byText = group.getByText(optionText, { exact: true });
+
+  let target = pressableExact;
+  if (await target.count() === 0) target = pressableLoose;
+  if (await target.count() === 0) target = labelExact;
+  if (await target.count() === 0) target = byText;
+
+  await target.first().scrollIntoViewIfNeeded();
+  await target.first().click();
+}
+
+function applyQuestionForm(page) {
+  const withStepButton = page.locator('form').filter({
+    has: page.getByRole('button', { name: /^(next|submit)$/i }),
+  });
+  return withStepButton.last();
+}
+
+async function fillRadioGroups(page, profile) {
+  const form = applyQuestionForm(page);
+  await form.getByRole('radiogroup').first().waitFor({ state: 'attached', timeout: 4000 }).catch(() => { });
+
+  let groups = form.getByRole('radiogroup');
+  let count = await groups.count();
+  if (count === 0) {
+    groups = form.locator('[role="radiogroup"]');
+    count = await groups.count();
+  }
+
+  const rawRadios = await form.locator('input[type="radio"]').count();
+  console.log('[apply-questions] radio scan', {
+    inForm: (await form.count()) > 0,
+    radiogroups: count,
+    rawRadioInputs: rawRadios,
+    officeDb: profile.can_work_3_days_in_office ?? null,
+    relocateDb: profile.willing_to_relocate ?? null,
+    sponsorshipDb: profile.require_future_sponsorship ?? profile.sponsorship ?? null,
+  });
+
+  for (let i = 0; i < count; i += 1) {
+    const group = groups.nth(i);
+    const already = await radioGroupAlreadyAnswered(group);
+    const question = await readRadioQuestion(group);
+    const options = await optionLabelsFromGroup(group);
+
+    console.log('[apply-questions] radio group', {
+      index: i,
+      question: question || '(empty)',
+      options,
+      alreadyAnswered: already,
+    });
+
+    if (already) continue;
+    if (!question || options.length === 0) {
+      return { ok: false, reason: `Found a radio group but could not read question/options (question="${question}")` };
+    }
+
+    const answer = ruleAnswer(question, options, profile);
+    console.log('[apply-questions] DB rule result', { question, answer: answer || '(no rule match)' });
+
+    let chosen = answer;
+    if (!chosen) {
+      const llm = await answerWithLlm({ question, options, type: 'radio', profile });
+      console.log('[apply-questions] LLM placeholder', llm);
+      if (llm?.skip || !llm?.answer) {
+        return { ok: false, reason: `Unanswered radio: ${question}` };
+      }
+      chosen = llm.answer;
+    }
+
+    const option = pickOption(options, chosen);
+    if (!option) {
+      return { ok: false, reason: `No matching radio option for: ${question}` };
+    }
+    console.log('[apply-questions] clicking radio', option);
+    await clickLabeledControl(group, option);
+  }
+
+  return { ok: true };
+}
+
+async function optionIsSelected(group, optionText) {
+  const exact = new RegExp(`^${escapeRegExp(optionText)}$`, 'i');
+  const label = group.locator('label').filter({ hasText: exact }).first();
+  if (await label.getAttribute('data-selected').catch(() => null) === 'true') return true;
+  return label.locator('input[type="checkbox"]').isChecked().catch(() => false);
+}
+
+async function collectCheckboxGroups(form) {
+  const byRole = form.locator('[role="group"]').filter({ has: form.locator('input[type="checkbox"]') });
+  const roleCount = await byRole.count();
+  if (roleCount > 0) {
+    const groups = [];
+    for (let i = 0; i < roleCount; i += 1) groups.push(byRole.nth(i));
+    return groups;
+  }
+
+  const boxes = form.locator('input[type="checkbox"]');
+  const boxCount = await boxes.count();
+  const seen = new Set();
+  const groups = [];
+  for (let i = 0; i < boxCount; i += 1) {
+    const name = (await boxes.nth(i).getAttribute('name')) || `__idx_${i}`;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const first = boxes.nth(i);
+    const ancestor = first.locator('xpath=ancestor::*[.//*[@slot="label"]][1]');
+    groups.push((await ancestor.count()) ? ancestor : first.locator('xpath=ancestor::div[1]'));
+  }
+  return groups;
+}
+
+async function fillCheckboxGroups(page, profile) {
+  const form = applyQuestionForm(page);
+  await form.locator('input[type="checkbox"]').first().waitFor({ state: 'attached', timeout: 2000 }).catch(() => { });
+
+  const groups = await collectCheckboxGroups(form);
+  const rawBoxes = await form.locator('input[type="checkbox"]').count();
+  console.log('[apply-questions] checkbox scan', {
+    inForm: (await form.count()) > 0,
+    checkboxGroups: groups.length,
+    rawCheckboxInputs: rawBoxes,
+    rolesDb: profile.job_role_preferences ?? null,
+    alternateRolesDb: profile.alternate_job_roles ?? null,
+  });
+
+  for (let i = 0; i < groups.length; i += 1) {
+    const group = groups[i];
+    const question = await readRadioQuestion(group);
+    const options = await optionLabelsFromGroup(group);
+
+    console.log('[apply-questions] checkbox group', {
+      index: i,
+      question: question || '(empty)',
+      options,
+    });
+
+    if (!question || options.length === 0) {
+      return { ok: false, reason: `Found a checkbox group but could not read question/options (question="${question}")` };
+    }
+
+    const answer = ruleAnswerMulti(question, options, profile);
+    console.log('[apply-questions] DB rule result', { question, answer: answer || '(no rule match)' });
+
+    let chosenList = answer;
+    if (!chosenList || !chosenList.length) {
+      const llm = await answerWithLlm({ question, options, type: 'checkbox', profile });
+      console.log('[apply-questions] LLM placeholder', llm);
+      if (llm?.skip || llm?.answer == null) {
+        return { ok: false, reason: `Unanswered checkbox: ${question}` };
+      }
+      chosenList = answersToList(llm.answer);
+    }
+
+    const toClick = pickAllOptions(options, chosenList);
+    if (!toClick.length) {
+      return { ok: false, reason: `No matching checkbox options for: ${question}` };
+    }
+
+    for (const option of toClick) {
+      if (await optionIsSelected(group, option)) {
+        console.log('[apply-questions] checkbox already selected', option);
+        continue;
+      }
+      console.log('[apply-questions] clicking checkbox', option);
+      await clickLabeledControl(group, option);
+    }
+  }
+
+  return { ok: true };
+}
+
+function looksLikeCoverLetter(text) {
+  return /cover letter/i.test(text);
+}
+
+async function readTextQuestion(field) {
+  const container = field.locator('xpath=ancestor::*[.//*[@slot="label"]][1]');
+  const slotLabel = normalizeText(await container.locator('[slot="label"]').first().innerText().catch(() => ''));
+  if (slotLabel) return slotLabel;
+
+  const labelledBy = await field.getAttribute('aria-labelledby');
+  if (labelledBy) {
+    const id = labelledBy.trim().split(/\s+/)[0];
+    const fromId = normalizeText(await field.page().locator(`[id="${id}"]`).innerText().catch(() => ''));
+    if (fromId) return fromId;
+  }
+
+  return normalizeText(await field.getAttribute('aria-label') || await field.getAttribute('placeholder') || '');
+}
+
+async function fillTextFields(page, profile) {
+  const form = applyQuestionForm(page);
+  await form.locator('textarea, input[type="text"]').first().waitFor({ state: 'attached', timeout: 2000 }).catch(() => { });
+
+  const fields = form.locator('textarea, input[type="text"]');
+  const count = await fields.count();
+  console.log('[apply-questions] text scan', {
+    inForm: (await form.count()) > 0,
+    textFields: count,
+    experienceDb: profile.experience ?? null,
+    startDateDb: profile.desired_start_date ?? null,
+  });
+
+  for (let i = 0; i < count; i += 1) {
+    const field = fields.nth(i);
+    if (!await field.isVisible().catch(() => false)) continue;
+    const current = normalizeText(await field.inputValue().catch(() => ''));
+    const question = await readTextQuestion(field);
+
+    console.log('[apply-questions] text field', {
+      index: i,
+      question: question || '(empty)',
+      alreadyFilled: Boolean(current),
+    });
+
+    if (current) continue;
+    if (looksLikeCoverLetter(question)) continue;
+    if (!question) {
+      return { ok: false, reason: 'Found a text field but could not read its question' };
+    }
+
+    const answer = ruleAnswer(question, [], profile);
+    console.log('[apply-questions] DB rule result', { question, answer: answer || '(no rule match)' });
+
+    let chosen = answer;
+    if (!chosen) {
+      const llm = await answerWithLlm({ question, options: [], type: 'text', profile });
+      console.log('[apply-questions] LLM placeholder', llm);
+      if (llm?.skip || !llm?.answer) {
+        const required = /required|\*/i.test(question);
+        if (required) return { ok: false, reason: `Unanswered text: ${question}` };
+        continue;
+      }
+      chosen = llm.answer;
+    }
+
+    console.log('[apply-questions] writing text', chosen);
+    await field.click();
+    await field.fill(String(chosen));
+  }
+
+  return { ok: true };
+}
+
+async function fillCurrentStep(page, profile) {
+  const resumeHeadingPresent = await isResumeCoverStep(page);
+  console.log('[apply-questions] fillCurrentStep', { resumeHeadingPresent });
+
+  const radioResult = await fillRadioGroups(page, profile);
+  if (!radioResult.ok) return radioResult;
+
+  const checkboxResult = await fillCheckboxGroups(page, profile);
+  if (!checkboxResult.ok) return checkboxResult;
+
+  if (resumeHeadingPresent) {
+    console.log('[apply-questions] skipping text/cover fields on resume step');
+    return { ok: true };
+  }
+
+  const textResult = await fillTextFields(page, profile);
+  if (!textResult.ok) return textResult;
+
+  return { ok: true };
+}
+
+async function isVisibleEnabled(locator) {
+  if (await locator.count() === 0) return false;
+  const button = locator.first();
+  if (!await button.isVisible().catch(() => false)) return false;
+  return button.isEnabled();
+}
+
+module.exports = {
+  answerWithLlm,
+  fillCurrentStep,
+  isVisibleEnabled,
+  loadApplyProfile,
+  ruleAnswer,
+};
+</file>
+
+<file path="lib/job-matching.js">
+const STOP_WORDS = new Set([
+  'a', 'an', 'and', 'at', 'for', 'in', 'of', 'on', 'or', 'the', 'to', 'with',
+]);
+
+function normalizeText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function tokens(value) {
+  return new Set(
+    normalizeText(value)
+      .split(/\s+/)
+      .filter((token) => token && !STOP_WORDS.has(token))
+  );
+}
+
+function roleMatchesJobTitle(jobTitle, roles, threshold = 0.75) {
+  const jobTokens = tokens(jobTitle);
+  if (!jobTokens.size) return false;
+
+  return (Array.isArray(roles) ? roles : [roles]).filter(Boolean).some((role) => {
+    const roleTokens = tokens(role);
+    if (!roleTokens.size) return false;
+
+    let overlap = 0;
+    for (const token of roleTokens) {
+      if (jobTokens.has(token)) overlap += 1;
+    }
+
+    const containment = overlap / Math.min(jobTokens.size, roleTokens.size);
+    const jaccard = overlap / (jobTokens.size + roleTokens.size - overlap);
+    return Math.max(containment, jaccard * 1.25) >= threshold;
+  });
+}
+
+function companyIsExcluded(company, excludedCompanies) {
+  const normalizedCompany = normalizeText(company);
+  if (!normalizedCompany) return false;
+
+  const exclusions = Array.isArray(excludedCompanies)
+    ? excludedCompanies
+    : String(excludedCompanies || '').split(/[,;|]/);
+
+  return exclusions.some((excluded) => {
+    const normalizedExcluded = normalizeText(excluded);
+    return normalizedExcluded
+      && (normalizedCompany === normalizedExcluded
+        || normalizedCompany.includes(normalizedExcluded)
+        || normalizedExcluded.includes(normalizedCompany));
+  });
+}
+
+function jobMatchesProfile(job, profile) {
+  const alternateRoles = Array.isArray(profile?.alternate_job_roles)
+    ? profile.alternate_job_roles
+    : String(profile?.alternate_job_roles || '').split(/[,;|]/);
+  const roles = [profile?.role, ...alternateRoles];
+
+  return roleMatchesJobTitle(job.title, roles)
+    && !companyIsExcluded(job.company, profile?.exclude_companies);
+}
+
+module.exports = {
+  companyIsExcluded,
+  jobMatchesProfile,
+  normalizeText,
+  roleMatchesJobTitle,
+};
+</file>
+
+<file path="lib/supabase.js">
+const { Pool } = require('pg');
+
+let pool;
+
+function requireDatabaseUrl() {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    throw new Error('DATABASE_URL must be set for the Azure PostgreSQL database.');
+  }
+  return databaseUrl;
+}
+
+function createPool() {
+  if (!pool) {
+    pool = new Pool({
+      connectionString: requireDatabaseUrl(),
+      ssl: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED === 'false'
+        ? { rejectUnauthorized: false }
+        : undefined,
+      max: Number(process.env.DATABASE_POOL_MAX || 10),
+    });
+  }
+  return pool;
+}
+
+function assertIdentifier(value, label) {
+  if (!/^[a-z_][a-z0-9_]*$/i.test(value)) {
+    throw new Error(`Invalid ${label}: ${value}`);
+  }
+  return `"${value}"`;
+}
+
+function parseColumns(columns) {
+  if (!columns || columns === '*') return '*';
+  return columns.split(',').map((column) => {
+    const trimmed = column.trim();
+    if (trimmed === '*') return '*';
+    return assertIdentifier(trimmed, 'column');
+  }).join(', ');
+}
+
+function createQueryBuilder(tableName) {
+  const table = assertIdentifier(tableName, 'table');
+  const state = {
+    operation: null,
+    columns: '*',
+    values: null,
+    filters: [],
+    orderBy: null,
+    returnRows: false,
+    count: false,
+    head: false,
+    conflict: null,
+  };
+
+  function addFilter(sql, value) {
+    state.filters.push({ sql, value });
+    return builder;
+  }
+
+  function buildWhere(parameters) {
+    if (state.filters.length === 0) return '';
+    const clauses = state.filters.map((filter) => {
+      if (filter.values) {
+        const placeholders = filter.values.map((value) => {
+          parameters.push(value);
+          return `$${parameters.length}`;
+        }).join(', ');
+        return filter.sql.replace('?', placeholders);
+      }
+      if (filter.value === undefined) return filter.sql;
+      parameters.push(filter.value);
+      return filter.sql.replace('?', `$${parameters.length}`);
+    });
+    return ` where ${clauses.join(' and ')}`;
+  }
+
+  async function execute() {
+    const parameters = [];
+    let text;
+
+    if (state.operation === 'select') {
+      const selected = state.head ? '1' : state.columns;
+      text = `select ${selected} from ${table}${buildWhere(parameters)}`;
+      if (state.orderBy) {
+        text += ` order by ${assertIdentifier(state.orderBy.column, 'order column')} ${state.orderBy.ascending ? 'asc' : 'desc'}`;
+      }
+    } else if (state.operation === 'insert' || state.operation === 'upsert') {
+      const rows = Array.isArray(state.values) ? state.values : [state.values];
+      if (rows.length === 0) throw new Error('Cannot insert an empty list.');
+      const columns = Object.keys(rows[0]);
+      const columnSql = columns.map((column) => assertIdentifier(column, 'column')).join(', ');
+      const rowSql = rows.map((row) => `(${columns.map((column) => {
+        parameters.push(row[column]);
+        return `$${parameters.length}`;
+      }).join(', ')})`).join(', ');
+      text = `insert into ${table} (${columnSql}) values ${rowSql}`;
+      if (state.operation === 'upsert') {
+        if (state.conflict) {
+          const conflictColumns = state.conflict.split(',').map((column) => assertIdentifier(column.trim(), 'conflict column')).join(', ');
+          text += ` on conflict (${conflictColumns}) do update set ${columns.map((column) => {
+            const identifier = assertIdentifier(column, 'column');
+            return `${identifier} = excluded.${identifier}`;
+          }).join(', ')}`;
+        } else {
+          text += ` on conflict do update set ${columns.map((column) => {
+            const identifier = assertIdentifier(column, 'column');
+            return `${identifier} = excluded.${identifier}`;
+          }).join(', ')}`;
+        }
+      }
+      if (state.returnRows) text += ` returning ${state.columns}`;
+    } else if (state.operation === 'update') {
+      const columns = Object.keys(state.values || {});
+      text = `update ${table} set ${columns.map((column) => {
+        parameters.push(state.values[column]);
+        return `${assertIdentifier(column, 'column')} = $${parameters.length}`;
+      }).join(', ')}${buildWhere(parameters)}`;
+      if (state.returnRows) text += ` returning ${state.columns}`;
+    } else if (state.operation === 'delete') {
+      text = `delete from ${table}${buildWhere(parameters)}`;
+      if (state.returnRows) text += ` returning ${state.columns}`;
+    } else {
+      throw new Error('A database operation was not selected.');
+    }
+
+    const result = await createPool().query(text, parameters);
+    if (state.head) return { data: null, error: null, count: result.rowCount };
+    const rows = result.rows;
+    if (state.singleMode && rows.length > 1) {
+      return {
+        data: null,
+        error: new Error('Expected one row, got multiple.'),
+      };
+    }
+    return {
+      data: state.singleMode ? (rows[0] || null) : (state.returnRows || state.operation === 'select' ? rows : null),
+      error: null,
+      count: state.operation === 'select' ? result.rowCount : undefined,
+    };
+  }
+
+  const builder = {
+    select(columns = '*', options = {}) {
+      if (!state.operation) state.operation = 'select';
+      state.columns = parseColumns(columns);
+      state.returnRows = state.operation !== 'select' || state.returnRows;
+      state.count = options.count === 'exact';
+      state.head = options.head === true;
+      return builder;
+    },
+    insert(values) {
+      state.operation = 'insert';
+      state.values = values;
+      return builder;
+    },
+    upsert(values, options = {}) {
+      state.operation = 'upsert';
+      state.values = values;
+      state.conflict = options.onConflict || null;
+      return builder;
+    },
+    update(values) {
+      state.operation = 'update';
+      state.values = values;
+      return builder;
+    },
+    delete() {
+      state.operation = 'delete';
+      return builder;
+    },
+    eq(column, value) {
+      return addFilter(`${assertIdentifier(column, 'filter column')} = ?`, value);
+    },
+    in(column, values) {
+      state.filters.push({
+        sql: `${assertIdentifier(column, 'filter column')} in (?)`,
+        values,
+      });
+      return builder;
+    },
+    is(column, value) {
+      if (value !== null) throw new Error('Only null is supported by is().');
+      return addFilter(`${assertIdentifier(column, 'filter column')} is null`);
+    },
+    order(column, options = {}) {
+      state.orderBy = { column, ascending: options.ascending !== false };
+      return builder;
+    },
+    maybeSingle() {
+      state.singleMode = true;
+      return execute();
+    },
+    single() {
+      state.singleMode = true;
+      return execute();
+    },
+  };
+
+  builder.then = (resolve, reject) => execute().then(resolve, reject);
+  builder.catch = (reject) => execute().catch(reject);
+  builder.finally = (callback) => execute().finally(callback);
+  return builder;
+}
+
+function createServiceClient() {
+  return {
+    from(table) {
+      return createQueryBuilder(table);
+    },
+    async rpc(functionName, args = {}) {
+      const fn = assertIdentifier(functionName, 'function');
+      const keys = Object.keys(args);
+      const values = keys.map((key) => args[key]);
+      const placeholders = keys.map((key, index) => `$${index + 1}`).join(', ');
+      const result = await createPool().query(`select * from public.${fn}(${placeholders})`, values);
+      return { data: result.rows, error: null };
+    },
+  };
+}
+
+module.exports = {
+  createPool,
+  createServiceClient,
+};
+</file>
+
+<file path="lib/workflow-state.js">
+function createWorkflowStateStore(supabase) {
+  async function get(chatId) {
+    const { data, error } = await supabase
+      .from('workflow_sessions')
+      .select('*')
+      .eq('telegram_chat_id', chatId)
+      .maybeSingle();
+    if (error) throw new Error(`Workflow state lookup failed: ${error.message}`);
+    return data;
+  }
+
+  async function save(chatId, changes) {
+    const { data, error } = await supabase
+      .from('workflow_sessions')
+      .upsert({ telegram_chat_id: chatId, ...changes }, { onConflict: 'telegram_chat_id' })
+      .select('*')
+      .single();
+    if (error) throw new Error(`Workflow state save failed: ${error.message}`);
+    return data;
+  }
+
+  async function recordPrompt(chatId, prompt) {
+    const { error } = await supabase.from('workflow_prompt_events').insert({
+      telegram_chat_id: chatId,
+      prompt_token: prompt.token,
+      url: prompt.url,
+      sent_at: new Date(prompt.sentAt).toISOString(),
+      expires_at: new Date(prompt.expiresAt).toISOString(),
+    });
+    if (error) throw new Error(`Workflow prompt save failed: ${error.message}`);
+  }
+
+  async function recordDecision(chatId, token, decision, clickedAt) {
+    const { data, error } = await supabase
+      .from('workflow_prompt_events')
+      .update({ decision, clicked_at: new Date(clickedAt).toISOString() })
+      .eq('telegram_chat_id', chatId)
+      .eq('prompt_token', token)
+      .is('decision', null)
+      .select('id')
+      .maybeSingle();
+    if (error) throw new Error(`Workflow decision save failed: ${error.message}`);
+    return Boolean(data);
+  }
+
+  async function log(chatId, event, details = {}) {
+    const { error } = await supabase.from('workflow_audit_logs').insert({
+      telegram_chat_id: chatId,
+      event,
+      details,
+    });
+    if (error) console.error(`Workflow audit log failed (${event}):`, error.message);
+  }
+
+  return { get, save, recordPrompt, recordDecision, log };
+}
+
+module.exports = { createWorkflowStateStore };
+</file>
+
+<file path="public/dashboard.css">
+:root {
+  color-scheme: light;
+  --ink: #17221e;
+  --muted: #68756f;
+  --paper: #f4f1e8;
+  --panel: #fffdf7;
+  --line: #d8d4c7;
+  --accent: #c95638;
+  --accent-dark: #8d3425;
+  --green: #2f7358;
+  font-family: Georgia, 'Times New Roman', serif;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; color: var(--ink); background: radial-gradient(circle at 15% 0%, #fff9e8 0, var(--paper) 40%, #e6eee6 100%); min-height: 100vh; }
+.shell { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 42px 0 72px; }
+.topbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; border-bottom: 1px solid var(--line); padding-bottom: 24px; }
+.eyebrow { color: var(--accent); font: 700 12px/1.2 Arial, sans-serif; letter-spacing: 2px; text-transform: uppercase; margin: 0 0 10px; }
+h1, h2, h3, p { margin-top: 0; }
+h1 { font-size: clamp(34px, 6vw, 68px); line-height: .96; margin-bottom: 12px; font-weight: 500; }
+h2 { font-size: 25px; font-weight: 500; }
+.muted { color: var(--muted); font: 14px/1.5 Arial, sans-serif; }
+.controls { display: flex; align-items: end; flex-wrap: wrap; gap: 16px; padding: 22px 0; }
+label { display: grid; gap: 7px; color: var(--muted); font: 12px/1.2 Arial, sans-serif; text-transform: uppercase; letter-spacing: .8px; }
+input, select { border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--ink); padding: 11px 12px; font: 16px Georgia, serif; text-transform: none; letter-spacing: 0; }
+.summary { margin-left: auto; color: var(--green); font: 700 14px Arial, sans-serif; }
+.button { border: 0; border-radius: 4px; background: var(--accent); color: white; cursor: pointer; padding: 11px 16px; font: 700 13px Arial, sans-serif; }
+.button:hover { background: var(--accent-dark); }
+.button.secondary { background: transparent; border: 1px solid var(--line); color: var(--ink); }
+.users { display: grid; gap: 10px; }
+.user { background: rgba(255, 253, 247, .84); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+.user summary { cursor: pointer; list-style: none; display: grid; grid-template-columns: minmax(180px, 1.3fr) minmax(120px, 1fr) auto; gap: 18px; align-items: center; padding: 18px 20px; }
+.user summary::-webkit-details-marker { display: none; }
+.user summary:hover { background: #fff9e9; }
+.user-name { font-size: 20px; }
+.user-email, .user-meta { color: var(--muted); font: 13px/1.4 Arial, sans-serif; }
+.badge { color: var(--green); font: 700 12px Arial, sans-serif; text-align: right; }
+.badge.idle { color: var(--muted); }
+.user-body { border-top: 1px solid var(--line); padding: 20px; display: grid; gap: 24px; max-height: 62vh; overflow-y: auto; }
+.timer { display: flex; flex-wrap: wrap; gap: 12px; }
+.metric { min-width: 150px; padding: 12px; border-left: 3px solid var(--accent); background: #f8f5eb; }
+.metric strong { display: block; font-size: 18px; font-weight: 500; }
+.metric span { color: var(--muted); font: 11px Arial, sans-serif; text-transform: uppercase; }
+.application-list { display: grid; gap: 10px; }
+.application-item { min-width: 0; padding: 12px; border-left: 3px solid var(--green); background: #f8f5eb; }
+.application-item strong, .application-item small { display: block; overflow-wrap: anywhere; }
+.application-item strong { font-size: 15px; font-weight: 500; }
+.application-item time, .application-item small { color: var(--muted); font: 12px/1.4 Arial, sans-serif; }
+.application-status { display: inline-block; margin: 6px 0; color: var(--green); font: 700 12px Arial, sans-serif; text-transform: uppercase; }
+.columns { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+.panel h3 { font-size: 16px; border-bottom: 1px solid var(--line); padding-bottom: 8px; margin-bottom: 0; }
+.log { display: grid; grid-template-columns: 155px 1fr; gap: 12px; border-bottom: 1px solid #e7e2d5; padding: 10px 0; font: 13px/1.45 Arial, sans-serif; }
+.log time { color: var(--muted); }
+.log strong { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
+.log pre { white-space: pre-wrap; margin: 4px 0 0; color: var(--muted); font: 12px/1.4 ui-monospace, monospace; }
+.login-panel { max-width: 420px; background: var(--panel); border: 1px solid var(--line); padding: 24px; }
+.login-panel form { display: grid; gap: 16px; }
+.error { color: var(--accent-dark); font: 13px Arial, sans-serif; min-height: 18px; }
+@media (max-width: 700px) {
+  .shell { width: min(100% - 20px, 1180px); padding-top: 24px; }
+  .topbar { align-items: flex-start; }
+  .user summary { grid-template-columns: 1fr auto; }
+  .user-email { grid-column: 1 / -1; grid-row: 2; }
+  .badge { grid-column: 2; grid-row: 1; }
+  .columns { grid-template-columns: 1fr; }
+  .log { grid-template-columns: 1fr; gap: 4px; }
+  .summary { margin-left: 0; width: 100%; }
+  .user-body { max-height: 55vh; }
+}
+</file>
+
+<file path="public/dashboard.html">
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Workflow dashboard</title>
+  <link rel="stylesheet" href="/dashboard.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Operations</p>
+        <h1>Workflow dashboard</h1>
+        <p class="muted" id="status">Loading...</p>
+      </div>
+      <button class="button secondary" id="logout">Log out</button>
+    </header>
+
+    <section class="controls" aria-label="Dashboard filters">
+      <label>Date <input type="date" id="date"></label>
+      <label>Timezone
+        <select id="timezone">
+          <option value="browser">Browser local</option>
+          <option value="UTC">UTC</option>
+          <option value="Pacific">Pacific</option>
+          <option value="Mountain">Mountain</option>
+          <option value="Central">Central</option>
+          <option value="Eastern">Eastern</option>
+        </select>
+      </label>
+      <div class="summary" id="summary"></div>
+    </section>
+
+    <section id="login" class="login-panel" hidden>
+      <h2>Operator sign in</h2>
+      <form id="login-form">
+        <label>Email <input type="email" id="email" required autocomplete="username"></label>
+        <label>Password <input type="password" id="password" required autocomplete="current-password"></label>
+        <button class="button" type="submit">Sign in</button>
+        <p class="error" id="login-error"></p>
+      </form>
+    </section>
+
+    <section id="users" class="users" hidden></section>
+  </main>
+  <script src="/dashboard.js"></script>
+</body>
+</html>
+</file>
+
+<file path="public/dashboard.js">
+const state = { timer: null, data: null };
+const dateInput = document.querySelector('#date');
+const timezoneInput = document.querySelector('#timezone');
+const statusText = document.querySelector('#status');
+const summary = document.querySelector('#summary');
+const users = document.querySelector('#users');
+const loginPanel = document.querySelector('#login');
+
+const today = new Date();
+dateInput.value = [today.getFullYear(), String(today.getMonth() + 1).padStart(2, '0'), String(today.getDate()).padStart(2, '0')].join('-');
+
+dateInput.addEventListener('change', loadDashboard);
+timezoneInput.addEventListener('change', loadDashboard);
+document.querySelector('#logout').addEventListener('click', async () => {
+  await fetch('/api/auth/logout', { method: 'POST' });
+  showLogin();
+});
+document.querySelector('#login-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const error = document.querySelector('#login-error');
+  error.textContent = '';
+  const response = await fetch('/api/auth/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      email: document.querySelector('#email').value,
+      password: document.querySelector('#password').value,
+    }),
+  });
+  if (!response.ok) {
+    error.textContent = (await response.json()).error || 'Sign in failed.';
+    return;
+  }
+  await loadDashboard();
+});
+
+async function loadDashboard() {
+  const params = new URLSearchParams({ date: dateInput.value, timezone: timezoneInput.value });
+  if (timezoneInput.value === 'browser') {
+    params.set('timezone_name', getBrowserTimezone());
+  }
+  const response = await fetch(`/api/dashboard?${params}`);
+  if (response.status === 401) return showLogin();
+  if (!response.ok) {
+    statusText.textContent = 'Dashboard data could not be loaded.';
+    return;
+  }
+  state.data = await response.json();
+  render(state.data);
+  startPolling();
+}
+
+function render(data) {
+  loginPanel.hidden = true;
+  users.hidden = false;
+  const active = data.users.filter((user) => user.has_activity).length;
+  summary.textContent = `${data.users.length} users · ${active} active · refreshed ${new Date().toLocaleTimeString()}`;
+  statusText.textContent = `${data.date} · ${data.timezone}`;
+  users.innerHTML = data.users.map((user) => renderUser(user, data.timezone_name)).join('');
+  startTimers();
+}
+
+function renderUser(user, timezoneName) {
+  const label = escapeHtml(user.full_name || user.company_email || `Telegram ${user.telegram_chat_id}`);
+  const email = escapeHtml(user.company_email || `Telegram ${user.telegram_chat_id}`);
+  const session = user.session;
+  const logs = user.audit_logs.map((row) => ({ time: row.created_at, type: row.event, details: row.details }));
+  user.prompt_events.forEach((row) => logs.push({ time: row.sent_at, type: `prompt: ${row.decision || 'waiting'}`, details: { url: row.url, expires_at: row.expires_at, clicked_at: row.clicked_at } }));
+  user.applications.forEach((row) => logs.push({ time: row.applied_at, type: `application: ${row.status}`, details: { job_name: row.job_name, url: row.url } }));
+  user.queue.forEach((row) => logs.push({ time: row.created_at, type: `queue: ${row.status}`, details: { url: row.url, available_at: row.available_at, started_at: row.started_at, finished_at: row.finished_at } }));
+  logs.sort((left, right) => new Date(left.time) - new Date(right.time));
+  const logHtml = logs.length ? logs.map((log) => `<div class="log"><time>${formatTime(log.time, timezoneName)}</time><div><strong>${escapeHtml(log.type)}</strong><pre>${escapeHtml(JSON.stringify(log.details || {}, null, 2))}</pre></div></div>`).join('') : '<p class="muted">No activity for this date.</p>';
+  const timer = session ? `<div class="timer"><div class="metric"><strong>${formatTime(session.session_started_at, timezoneName)}</strong><span>9-hour window start</span></div><div class="metric"><strong>${formatTime(session.session_deadline, timezoneName)}</strong><span>window deadline</span></div><div class="metric"><strong data-countdown="${escapeHtml(session.session_deadline || '')}">${remaining(session.session_deadline)}</strong><span>window remaining</span></div><div class="metric"><strong>${formatTime(session.next_scan_at, timezoneName)}</strong><span>next link</span></div></div>` : '<p class="muted">No workflow session recorded for this date.</p>';
+  return `<details class="user"><summary><span class="user-name">${label}</span><span class="user-email">${email}</span><span class="badge ${user.has_activity ? '' : 'idle'}">${user.has_activity ? `${logs.length} events` : 'No activity'}</span></summary><div class="user-body">${timer}<div class="columns"><section class="panel"><h3>Timeline</h3>${logHtml}</section><section class="panel"><h3>Application status</h3>${renderCurrent(user, timezoneName)}</section></div></div></details>`;
+}
+
+function renderCurrent(user, timezoneName) {
+  if (!user.applications.length) return '<p class="muted">No application status recorded.</p>';
+  return `<div class="application-list">${user.applications.map((application) => `<article class="application-item"><strong>${escapeHtml(application.job_name || 'Unnamed job')}</strong><span class="application-status">${escapeHtml(application.status || 'Unknown')}</span><time>${formatTime(application.applied_at, timezoneName)}</time><small>${escapeHtml(application.url || '')}</small></article>`).join('')}</div>`;
+}
+
+function showLogin() {
+  if (state.timer) clearInterval(state.timer);
+  loginPanel.hidden = false;
+  users.hidden = true;
+  statusText.textContent = 'Sign in to view workflow activity.';
+}
+
+function startPolling() {
+  if (state.timer) return;
+  state.timer = setInterval(loadDashboard, 30 * 60 * 1000);
+}
+
+function startTimers() {
+  if (state.countdownTimer) clearInterval(state.countdownTimer);
+  state.countdownTimer = setInterval(() => {
+    document.querySelectorAll('[data-countdown]').forEach((element) => {
+      element.textContent = remaining(element.dataset.countdown);
+    });
+  }, 1000);
+}
+
+function remaining(deadline) {
+  const seconds = Math.max(0, Math.floor((new Date(deadline).getTime() - Date.now()) / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainder = seconds % 60;
+  return `${hours}h ${String(minutes).padStart(2, '0')}m ${String(remainder).padStart(2, '0')}s`;
+}
+
+function formatTime(value, timezoneName) {
+  if (!value) return '—';
+  return new Date(value).toLocaleString(undefined, { timeZone: timezoneName });
+}
+
+function getBrowserTimezone() {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
+}
+
+loadDashboard();
+</file>
+
+<file path="scripts/create-operator.js">
+require('dotenv').config();
+
+const bcrypt = require('bcryptjs');
+const { createPool } = require('../lib/supabase');
+
+const args = new Map();
+for (let index = 2; index < process.argv.length; index += 1) {
+  const [key, value] = process.argv[index].split('=', 2);
+  if (key && value) args.set(key.replace(/^--/, ''), value);
+}
+
+const email = String(args.get('email') || '').trim().toLowerCase();
+const password = String(args.get('password') || '');
+
+if (!email || !email.includes('@') || password.length < 12) {
+  console.error('Usage: npm run create-operator -- --email=operator@example.com --password="at-least-12-characters"');
+  process.exit(1);
+}
+
+(async () => {
+  const db = createPool();
+  const passwordHash = await bcrypt.hash(password, 12);
+  await db.query(
+    `insert into operator_accounts (email, password_hash)
+     values ($1, $2)
+     on conflict (email) do update set password_hash = excluded.password_hash, disabled = false`,
+    [email, passwordHash]
+  );
+  console.log(`Operator account ready: ${email}`);
+  await db.end();
+})().catch(async (error) => {
+  console.error(`Could not create operator: ${error.message}`);
+  process.exitCode = 1;
+});
+</file>
+
+<file path="scripts/import-clients.js">
+require('dotenv').config();
+
+const fs = require('fs');
+const path = require('path');
+const { createServiceClient } = require('../lib/supabase');
+const { mapImportItem } = require('./map-client-record');
+
+async function loadRecords() {
+  const apiUrl = process.env.CLIENTS_API_URL;
+  if (apiUrl) {
+    const headers = { Accept: 'application/json' };
+    if (process.env.CLIENTS_API_TOKEN) {
+      headers.Authorization = `Bearer ${process.env.CLIENTS_API_TOKEN}`;
+    }
+    const response = await fetch(apiUrl, { headers });
+    if (!response.ok) {
+      throw new Error(`CLIENTS_API_URL failed: ${response.status} ${response.statusText}`);
+    }
+    const payload = await response.json();
+    if (Array.isArray(payload)) return payload;
+    if (Array.isArray(payload.records)) return payload.records;
+    if (Array.isArray(payload.data)) return payload.data;
+    if (payload.client) return [payload];
+    throw new Error('API response was not an array of client records.');
+  }
+
+  const filePath = process.argv[2] || path.join('data', 'sample-clients.json');
+  const resolved = path.resolve(filePath);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Import file not found: ${resolved}`);
+  }
+  const payload = JSON.parse(fs.readFileSync(resolved, 'utf8'));
+  if (Array.isArray(payload)) return payload;
+  if (payload.client) return [payload];
+  throw new Error('JSON file must be an array of { client, additional_information } records.');
+}
+
+async function importRecords(records) {
+  const supabase = createServiceClient();
+  let imported = 0;
+  let failed = 0;
+
+  for (const [index, item] of records.entries()) {
+    let applywizzId = `row ${index + 1}`;
+    try {
+      const { clientRow, profileRow } = mapImportItem(item);
+      applywizzId = clientRow.applywizz_id;
+
+      const { error: clientError } = await supabase
+        .from('clients')
+        .upsert(clientRow, { onConflict: 'id' });
+      if (clientError) throw clientError;
+
+      if (profileRow) {
+        const { error: profileError } = await supabase
+          .from('client_profiles')
+          .upsert(profileRow, { onConflict: 'id' });
+        if (profileError) throw profileError;
+      }
+
+      imported += 1;
+      console.log(`[ok] ${applywizzId} (${clientRow.company_email})`);
+    } catch (error) {
+      failed += 1;
+      console.error(`[fail] ${applywizzId}: ${error.message}`);
+    }
+  }
+
+  console.log(`Import finished. imported=${imported} failed=${failed} total=${records.length}`);
+  if (failed > 0 && imported === 0) process.exit(1);
+}
+
+loadRecords()
+  .then(importRecords)
+  .catch((error) => {
+    console.error(error.message);
+    process.exit(1);
+  });
+</file>
+
+<file path="scripts/map-client-record.js">
+const crypto = require('crypto');
+
+function asText(value) {
+  if (value == null) return null;
+  const text = String(value).trim();
+  return text === '' ? null : text;
+}
+
+function asUuid(value) {
+  const text = asText(value);
+  if (!text || text === '-') return null;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(text)
+    ? text
+    : null;
+}
+
+function asDate(value) {
+  const text = asText(value);
+  if (!text) return null;
+  if (/^\d{4}-\d{2}-\d{2}/.test(text)) return text.slice(0, 10);
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString().slice(0, 10);
+}
+
+function asTimestamptz(value) {
+  const text = asText(value);
+  if (!text) return null;
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
+function asBoolean(value) {
+  if (value == null || value === '') return null;
+  if (typeof value === 'boolean') return value;
+  const text = String(value).trim().toLowerCase();
+  if (['true', 'yes', '1'].includes(text)) return true;
+  if (['false', 'no', '0'].includes(text)) return false;
+  return null;
+}
+
+function asInteger(value) {
+  if (value == null || value === '') return null;
+  const number = Number(value);
+  return Number.isInteger(number) ? number : null;
+}
+
+function asTextArray(value) {
+  if (value == null || value === '') return null;
+  if (Array.isArray(value)) {
+    const items = value.map((item) => String(item).trim()).filter(Boolean);
+    return items.length ? items : null;
+  }
+  return null;
+}
+
+function parseExcludeCompanies(value) {
+  if (value == null || value === '') return { parsed: null, raw: null };
+  if (Array.isArray(value)) {
+    const parsed = value.flatMap((item) => String(item).split(',').map((part) => part.trim()).filter(Boolean));
+    return { parsed: parsed.length ? parsed : null, raw: JSON.stringify(value) };
+  }
+
+  const raw = String(value);
+  try {
+    const parsedJson = JSON.parse(raw);
+    if (Array.isArray(parsedJson)) {
+      const parsed = parsedJson.flatMap((item) => String(item).split(',').map((part) => part.trim()).filter(Boolean));
+      return { parsed: parsed.length ? parsed : null, raw };
+    }
+  } catch {
+    // keep raw string
+  }
+
+  const parsed = raw.split(',').map((part) => part.replace(/[[\]"]/g, '').trim()).filter(Boolean);
+  return { parsed: parsed.length ? parsed : null, raw };
+}
+
+function unwrapRecord(item) {
+  if (!item || typeof item !== 'object') return { client: null, additional: null };
+  if (item.client) {
+    return { client: item.client, additional: item.additional_information || null };
+  }
+  return { client: item, additional: item.additional_information || null };
+}
+
+function mapClientRow(client) {
+  const companyEmail = asText(client.company_email);
+  const applywizzId = asText(client.applywizz_id);
+  if (!companyEmail || !applywizzId) {
+    throw new Error('client is missing company_email or applywizz_id');
+  }
+
+  return {
+    id: asUuid(client.id) || crypto.randomUUID(),
+    applywizz_id: applywizzId,
+    full_name: asText(client.full_name || client.name),
+    personal_email: asText(client.personal_email),
+    company_email: companyEmail,
+    whatsapp_number: asText(client.whatsapp_number),
+    callable_phone: asText(client.callable_phone || client.phone),
+    job_role_preferences: asTextArray(client.job_role_preferences),
+    salary_range: asText(client.salary_range),
+    location_preferences: asTextArray(client.location_preferences),
+    work_auth_details: asText(client.work_auth_details),
+    account_manager_id: asUuid(client.account_manager_id),
+    onboarded_by: asUuid(client.onboarded_by),
+    career_associate_id: asUuid(client.careerassociateid || client.career_associate_id),
+    scraper_id: asUuid(client.scraperid || client.scraper_id),
+    career_associate_manager_id: asUuid(client.careerassociatemanagerid || client.career_associate_manager_id),
+    client_office_id: asText(client.clientofficeid || client.client_office_id),
+    onboarding_date: asDate(client.onboardingdate || client.onboarding_date),
+    visa_type: asText(client.visa_type),
+    sponsorship: asBoolean(client.sponsorship),
+    badge_value: asInteger(client.badge_value),
+    coding_labs: asBoolean(client.coding_labs),
+    coding_lab_url: asText(client.coding_lab_url),
+    opted_job_links: asBoolean(client.opted_job_links),
+    lab_id_1: asUuid(client.lab_id_1),
+    lab_id_2: asUuid(client.lab_id_2),
+    mcq_results: client.mcq_results ?? null,
+    test_results: client.test_results ?? null,
+    status: asText(client.status),
+    role_last_updated: asTimestamptz(client.role_last_updated),
+    crm_created_at: asTimestamptz(client.created_at),
+    crm_updated_at: asTimestamptz(client.update_at || client.updated_at),
+    imported_at: new Date().toISOString(),
+    raw_payload: client,
+  };
+}
+
+function mapProfileRow(clientId, applywizzId, additional) {
+  if (!additional || typeof additional !== 'object') return null;
+  const exclude = parseExcludeCompanies(additional.exclude_companies);
+
+  return {
+    id: asUuid(additional.id) || clientId,
+    applywizz_id: asText(additional.applywizz_id) || applywizzId,
+    resume_url: asText(additional.resume_url),
+    resume_path: asText(additional.resume_path),
+    cover_letter_path: asText(additional.cover_letter_path),
+    google_drive_resume_link: asText(additional.google_drive_resume_link),
+    start_date: asDate(additional.start_date),
+    end_date: asDate(additional.end_date),
+    no_of_applications: asInteger(additional.no_of_applications),
+    is_over_18: asBoolean(additional.is_over_18),
+    eligible_to_work_in_us: asBoolean(additional.eligible_to_work_in_us),
+    authorized_without_visa: asBoolean(additional.authorized_without_visa),
+    require_future_sponsorship: asBoolean(additional.require_future_sponsorship),
+    can_perform_essential_functions: asBoolean(additional.can_perform_essential_functions),
+    worked_for_company_before: asBoolean(additional.worked_for_company_before),
+    discharged_for_policy_violation: asBoolean(additional.discharged_for_policy_violation),
+    referred_by_agency: asBoolean(additional.referred_by_agency),
+    highest_education: asText(additional.highest_education),
+    university_name: asText(additional.university_name),
+    cumulative_gpa: asText(additional.cumulative_gpa),
+    desired_start_date: asDate(additional.desired_start_date),
+    willing_to_relocate: asBoolean(additional.willing_to_relocate),
+    can_work_3_days_in_office: asBoolean(additional.can_work_3_days_in_office),
+    role: asText(additional.role),
+    experience: additional.experience == null ? null : String(additional.experience),
+    work_preferences: asText(additional.work_preferences),
+    alternate_job_roles: asText(additional.alternate_job_roles),
+    exclude_companies: exclude.parsed,
+    exclude_companies_raw: exclude.raw,
+    convicted_of_felony: asBoolean(additional.convicted_of_felony),
+    felony_explanation: asText(additional.felony_explanation),
+    pending_investigation: asBoolean(additional.pending_investigation),
+    willing_background_check: asBoolean(additional.willing_background_check),
+    willing_drug_screen: asBoolean(additional.willing_drug_screen),
+    failed_or_refused_drug_test: asBoolean(additional.failed_or_refused_drug_test),
+    uses_substances_affecting_duties: asBoolean(additional.uses_substances_affecting_duties),
+    substances_description: asText(additional.substances_description),
+    can_provide_legal_docs: asBoolean(additional.can_provide_legal_docs),
+    gender: asText(additional.gender),
+    is_hispanic_latino: asText(additional.is_hispanic_latino),
+    race_ethnicity: asText(additional.race_ethnicity),
+    veteran_status: asText(additional.veteran_status),
+    disability_status: asText(additional.disability_status),
+    has_relatives_in_company: asBoolean(additional.has_relatives_in_company),
+    relatives_details: asText(additional.relatives_details),
+    state_of_residence: asText(additional.state_of_residence),
+    zip_or_country: asText(additional.zip_or_country),
+    full_address: asText(additional.full_address),
+    date_of_birth: asDate(additional.date_of_birth),
+    primary_phone: asText(additional.primary_phone),
+    main_subject: asText(additional.main_subject),
+    graduation_year: additional.graduation_year == null ? null : String(additional.graduation_year),
+    add_ons_info: asTextArray(additional.add_ons_info),
+    github_url: asText(additional.github_url),
+    linked_in_url: asText(additional.linked_in_url),
+    client_form_fill_date: asTimestamptz(additional.client_form_fill_date),
+    working_status: asText(additional.working_status),
+    crm_created_at: asTimestamptz(additional.created_at),
+    crm_updated_at: asTimestamptz(additional.updated_at),
+    raw_payload: additional,
+  };
+}
+
+function mapImportItem(item) {
+  const { client, additional } = unwrapRecord(item);
+  if (!client) throw new Error('record is missing client data');
+  const clientRow = mapClientRow(client);
+  const profileRow = mapProfileRow(clientRow.id, clientRow.applywizz_id, additional);
+  return { clientRow, profileRow };
+}
+
+module.exports = {
+  mapImportItem,
+};
+</file>
+
+<file path="scripts/smoke-browserbase.js">
+require('dotenv').config();
+
+const { openBrowser, closeBrowser, useBrowserbase } = require('../lib/browser');
+
+async function main() {
+  if (!useBrowserbase) {
+    throw new Error('Set USE_BROWSERBASE=true to run this smoke test.');
+  }
+  if (!process.env.BROWSERBASE_API_KEY) {
+    throw new Error('BROWSERBASE_API_KEY is missing.');
+  }
+  if (!process.env.BROWSERBASE_PROJECT_ID) {
+    throw new Error('BROWSERBASE_PROJECT_ID is missing. Copy it from Browserbase Settings.');
+  }
+
+  console.log('Opening Browserbase session...');
+  const handle = await openBrowser({ headless: true });
+  try {
+    console.log(`sessionId=${handle.sessionId}`);
+    console.log(`provider=${handle.provider}`);
+    await handle.page.goto('https://example.com', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    const title = await handle.page.title();
+    console.log(`page title: ${title}`);
+    console.log(`replay: https://www.browserbase.com/sessions/${handle.sessionId}`);
+    console.log('Smoke test OK');
+  } finally {
+    await closeBrowser(handle);
+  }
+}
+
+main().catch((error) => {
+  console.error('Smoke test failed:', error.message);
+  process.exit(1);
+});
+</file>
+
+<file path="scripts/verify-client-lookup.js">
+require('dotenv').config();
+
+const { createServiceClient } = require('../lib/supabase');
+
+const email = (process.argv[2] || 'ramgopalvarma8520@gmail.com').trim();
+
+async function main() {
+  const supabase = createServiceClient();
+  const { data: client, error } = await supabase
+    .from('clients')
+    .select('id, applywizz_id, company_email, full_name')
+    .eq('company_email', email)
+    .maybeSingle();
+
+  if (error) throw error;
+  if (!client) {
+    throw new Error(`No client found for ${email}`);
+  }
+
+  const { data: profile, error: profileError } = await supabase
+    .from('client_profiles')
+    .select('id, applywizz_id, role, resume_path')
+    .eq('id', client.id)
+    .maybeSingle();
+  if (profileError) throw profileError;
+
+  console.log(JSON.stringify({
+    lookup: email,
+    client,
+    profile: profile || null,
+    applywizz_id_ok: client.applywizz_id === 'AWL-001' || Boolean(client.applywizz_id),
+  }, null, 2));
+}
+
+main().catch((error) => {
+  console.error(error.message);
+  process.exit(1);
+});
+</file>
+
+<file path="test/apply-queue.test.js">
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { createApplyQueue } = require('../lib/apply-queue');
+
+test('hasActiveClientJob detects queued or running work for the same client', async () => {
+  const supabase = {
+    from(table) {
+      assert.equal(table, 'apply_queue');
+      return {
+        select() {
+          return {
+            eq() {
+              return {
+                in() {
+                  return {
+                    maybeSingle: async () => ({
+                      data: { id: 101, status: 'queued' },
+                      error: null,
+                    }),
+                  };
+                },
+              };
+            },
+          };
+        },
+      };
+    },
+  };
+
+  const queue = createApplyQueue(supabase);
+  const active = await queue.hasActiveClientJob(42);
+  assert.equal(active, true);
+});
+</file>
+
+<file path="test/job-matching.test.js">
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { companyIsExcluded, jobMatchesProfile, roleMatchesJobTitle } = require('../lib/job-matching');
+
+test('matches close job titles against primary or alternate roles', () => {
+  assert.equal(roleMatchesJobTitle('Senior Backend Software Engineer', ['Software Engineer']), true);
+  assert.equal(roleMatchesJobTitle('Graphic Designer', ['Software Engineer', 'Backend Developer']), false);
+  assert.equal(jobMatchesProfile(
+    { title: 'Senior Backend Software Engineer', company: 'Acme Labs' },
+    { role: 'Software Engineer', alternate_job_roles: ['Backend Developer'], exclude_companies: [] }
+  ), true);
+});
+
+test('rejects excluded companies case-insensitively', () => {
+  assert.equal(companyIsExcluded('Acme Labs, Inc.', ['acme labs']), true);
+  assert.equal(jobMatchesProfile(
+    { title: 'Software Engineer', company: 'Acme Labs' },
+    { role: 'Software Engineer', alternate_job_roles: [], exclude_companies: ['ACME LABS'] }
+  ), false);
+});
+</file>
+
+<file path=".dockerignore">
+node_modules
+.env
+.env.*
+.git
+.gitignore
+*.log
+</file>
+
+<file path=".env.example">
+DATABASE_URL=postgresql://user:password@azure-host:5432/database?sslmode=require
+DATABASE_SSL_REJECT_UNAUTHORIZED=false
+DATABASE_POOL_MAX=10
+PORT=3000
+
+BOT_TOKEN=
+CHAT_ID=
+DICE_PASSWORD=
+SENDGRID_API_KEY=
+SENDER_EMAIL=noreply@applywizz.com
+BROWSERBASE_API_KEY=
+BROWSERBASE_PROJECT_ID=
+BROWSERBASE_MAX_CONCURRENT=1
+USE_BROWSERBASE=false
+</file>
+
+<file path=".gitignore">
+.env
+node_modules/
+</file>
+
+<file path="Dockerfile">
+FROM node:22-bookworm
+
+WORKDIR /app
+
+COPY package*.json ./
+
+RUN npm install --omit=dev
+RUN npx playwright install --with-deps chromium
+
+COPY . .
+
+ENV NODE_ENV=production
+
+CMD ["node", "index.js"]
+</file>
+
 <file path="index.js">
 require('dotenv').config();
 
@@ -3565,6 +3524,7 @@ const SESSION_MS = 9 * 60 * 60 * 1000;
 const LINK_CUTOFF_MS = (8 * 60 + 32) * 60 * 1000;
 const DECISION_TIMEOUT_MS = 15 * 60 * 1000;
 const NEXT_LINK_DELAY_MS = 28 * 60 * 1000;
+const NEWDAY_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 
 if (!botToken) {
   throw new Error('BOT_TOKEN must be set in the environment.');
@@ -3593,14 +3553,23 @@ function stateFor(chatId) {
       currentPromptUrl: null,
       currentPromptSentAt: null,
       currentPromptExpiresAt: null,
+      newdayRequestedAt: null,
+      runGeneration: 0,
+      newdayInProgress: null,
     });
   }
   return userStates.get(chatId);
 }
 
 // === TELEGRAM HELPERS ===
-function sendMessage(chatId, text, options = {}) {
-  return bot.api.sendMessage({ chat_id: chatId, text, ...options }).catch(console.error);
+async function sendMessage(chatId, text, options = {}) {
+  try {
+    await bot.api.sendMessage({ chat_id: chatId, text, ...options });
+    return true;
+  } catch (error) {
+    console.error(`[User ${chatId}] Telegram message failed:`, error.message);
+    return false;
+  }
 }
 
 function sendMessageWithButtons(chatId, text, buttons) {
@@ -3661,6 +3630,7 @@ async function hydrateWorkflowState(chatId) {
   state.currentPromptUrl = row.current_prompt_url;
   state.currentPromptSentAt = row.current_prompt_sent_at ? Date.parse(row.current_prompt_sent_at) : null;
   state.currentPromptExpiresAt = row.current_prompt_expires_at ? Date.parse(row.current_prompt_expires_at) : null;
+  state.newdayRequestedAt = row.newday_requested_at ? Date.parse(row.newday_requested_at) : null;
   return state;
 }
 
@@ -3674,6 +3644,7 @@ async function persistWorkflowState(chatId, state, changes = {}) {
     current_prompt_url: state.currentPromptUrl,
     current_prompt_sent_at: state.currentPromptSentAt ? new Date(state.currentPromptSentAt).toISOString() : null,
     current_prompt_expires_at: state.currentPromptExpiresAt ? new Date(state.currentPromptExpiresAt).toISOString() : null,
+    newday_requested_at: state.newdayRequestedAt ? new Date(state.newdayRequestedAt).toISOString() : null,
     ...changes,
     updated_at: new Date().toISOString(),
   });
@@ -3952,21 +3923,26 @@ async function refreshLogin(chatId) {
 }
 
 // === JOBS & APPLICATIONS ===
-async function readJobUrls() {
+async function readJobUrls(scrapedAfter = null) {
   const { data, error } = await supabase
     .from('jobs')
-    .select('url, title, company, applywizz_id, company_email');
+    .select('url, title, company, applywizz_id, company_email, scraped_at');
 
   if (error) {
     console.error('Failed to load jobs:', error.message);
     return [];
   }
-  return (data || []).map((job) => ({
+  return (data || []).filter((job) => {
+    if (!scrapedAfter) return true;
+    const scrapedAt = Date.parse(job.scraped_at || '');
+    return Number.isFinite(scrapedAt) && scrapedAt >= scrapedAfter;
+  }).map((job) => ({
     url: job.url,
     title: job.title,
     company: job.company,
     applywizzId: job.applywizz_id,
     companyEmail: job.company_email,
+    scrapedAt: job.scraped_at,
   }));
 }
 
@@ -4218,10 +4194,11 @@ async function runJobsLoop(chatId) {
   } catch (error) {
     console.error(`[User ${chatId}] Could not restore workflow state:`, error.message);
   }
+  const runGeneration = state.runGeneration;
   state.jobRunnerActive = true;
   console.log(`[User ${chatId}] Job loop started.`);
 
-  while (state.jobRunnerActive) {
+  while (state.jobRunnerActive && state.runGeneration === runGeneration) {
     if (state.nextScanAt > Date.now()) {
       await waitUntil(state.nextScanAt);
       continue;
@@ -4258,7 +4235,10 @@ async function runJobsLoop(chatId) {
       continue;
     }
 
-    const jobs = await readJobUrls();
+    const scrapedAfter = state.newdayRequestedAt
+      ? state.newdayRequestedAt - NEWDAY_LOOKBACK_MS
+      : null;
+    const jobs = await readJobUrls(scrapedAfter);
     const urls = jobs.map((job) => job.url);
     const hasNewUrl = urls.some((url) => !state.knownJobUrls.has(url));
     state.knownJobUrls = new Set(urls);
@@ -4280,7 +4260,7 @@ async function runJobsLoop(chatId) {
 
     for (const job of jobs) {
       const { url } = job;
-      if (!state.jobRunnerActive) {
+      if (!state.jobRunnerActive || state.runGeneration !== runGeneration) {
         console.log(`[User ${chatId}] Job runner stopped.`);
         break;
       }
@@ -4312,6 +4292,11 @@ async function runJobsLoop(chatId) {
         break;
       }
 
+      if (String(job.applywizzId || '') !== String(applyProfile.applywizz_id || '')
+        || String(job.companyEmail || '').trim().toLowerCase() !== String(applyProfile.company_email || '').trim().toLowerCase()) {
+        continue;
+      }
+
       if (!state.sessionStartedAt) {
         state.sessionStartedAt = Date.now();
         state.sessionDeadline = state.sessionStartedAt + SESSION_MS;
@@ -4322,11 +4307,6 @@ async function runJobsLoop(chatId) {
           deadlineAt: new Date(state.sessionDeadline).toISOString(),
           linkCutoffAt: new Date(state.sessionStartedAt + LINK_CUTOFF_MS).toISOString(),
         });
-      }
-
-      if (String(job.applywizzId || '') !== String(applyProfile.applywizz_id || '')
-        || String(job.companyEmail || '').trim().toLowerCase() !== String(applyProfile.company_email || '').trim().toLowerCase()) {
-        continue;
       }
 
       unhandledUrlFound = true;
@@ -4371,6 +4351,7 @@ async function runJobsLoop(chatId) {
         Math.max(0, state.sessionDeadline - promptSentAt)
       );
       const response = await waitForDecision(chatId, decisionWaitMs);
+      if (state.runGeneration !== runGeneration) break;
       const clickAt = response.clickedAt || Date.now();
       await audit(chatId, response.decision === null ? 'job_missed' : response.decision ? 'job_yes' : 'job_no', {
         url,
@@ -4498,19 +4479,26 @@ async function runJobsLoop(chatId) {
       }
     }
 
-    const activeClientJob = clientId && await applyQueue.hasActiveClientJob(clientId);
+    const activeClientJob = clientId
+      ? await applyQueue.hasActiveClientJob(clientId)
+      : false;
+    const allRecentJobsHandled = urls.length > 0 && !unhandledUrlFound && !activeClientJob;
     if (
-      urls.length > 0 &&
-      !unhandledUrlFound &&
-      !activeClientJob &&
+      allRecentJobsHandled &&
       !state.completionNotified &&
-      state.jobRunnerActive
+      state.jobRunnerActive &&
+      state.runGeneration === runGeneration
     ) {
-      state.completionNotified = true;
-      await sendMessage(
+      const details = {
+        jobCount: urls.length,
+        checkedAt: new Date().toISOString(),
+      };
+      await audit(chatId, 'all_jobs_completed', details);
+      const sent = await sendMessage(
         chatId,
         'All jobs from the CSV have been completed. I will wait for new job links.'
       );
+      if (sent) state.completionNotified = true;
     }
 
     if (!offeredAny && state.jobRunnerActive) {
@@ -4592,9 +4580,74 @@ async function runSignInWorkflow(chatId, { greet = false } = {}) {
   }
 }
 
+async function startNewday(chatId) {
+  const state = stateFor(chatId);
+  if (state.newdayInProgress) return state.newdayInProgress;
+
+  state.newdayInProgress = (async () => {
+    await hydrateWorkflowState(chatId);
+    if (Number.isFinite(state.sessionDeadline) && state.sessionDeadline > Date.now()) {
+      await sendMessage(chatId, 'Your 9-hour job session is still active. Try /newday after it ends.');
+      return;
+    }
+
+    const activeSession = await readActiveSession(chatId);
+    if (!activeSession) {
+      await sendMessage(chatId, 'Please sign in first with /start.');
+      return;
+    }
+
+    state.jobRunnerActive = false;
+    state.runGeneration += 1;
+    if (state.decisionTimer) clearTimeout(state.decisionTimer);
+    if (state.decisionResolver) state.decisionResolver(false);
+    state.decisionTimer = null;
+    state.decisionResolver = null;
+    state.currentPromptToken = null;
+    state.currentPromptUrl = null;
+    state.currentPromptSentAt = null;
+    state.currentPromptExpiresAt = null;
+    state.sessionStartedAt = null;
+    state.sessionDeadline = null;
+    state.nextScanAt = 0;
+    state.consecutiveNoCount = 0;
+    state.completionNotified = false;
+    state.knownJobUrls = new Set();
+    state.pendingJobUrl = {};
+    state.newdayRequestedAt = Date.now();
+
+    await persistWorkflowState(chatId, state, {
+      session_started_at: null,
+      session_deadline: null,
+      next_scan_at: null,
+      consecutive_no_count: 0,
+      current_prompt_token: null,
+      current_prompt_url: null,
+      current_prompt_sent_at: null,
+      current_prompt_expires_at: null,
+      last_decision: null,
+      last_decision_at: null,
+    });
+    await audit(chatId, 'newday_started', {
+      requestedAt: new Date(state.newdayRequestedAt).toISOString(),
+      jobsSince: new Date(state.newdayRequestedAt - NEWDAY_LOOKBACK_MS).toISOString(),
+    });
+
+    state.jobRunnerActive = true;
+    runJobsLoop(chatId).catch((error) => {
+      console.error(`[User ${chatId}] New-day job loop failed:`, error.message);
+    });
+    await sendMessage(chatId, 'New day started. I will send the first eligible job scraped within the last 24 hours.');
+  })().finally(() => {
+    state.newdayInProgress = null;
+  });
+
+  return state.newdayInProgress;
+}
+
 async function handleCommand(chatId, text) {
   const state = stateFor(chatId);
-  const normalized = text.toLowerCase().replace(/[\/]+/g, '').trim();
+  const normalized = text.toLowerCase().replace(/^[/#]+/, '').trim();
 
   if (['continue', 'yes', 'y'].includes(normalized) && state.decisionResolver) {
     const resolver = state.decisionResolver;
@@ -4626,6 +4679,11 @@ async function handleCommand(chatId, text) {
 
   if (state.workflowActive) {
     await sendMessage(chatId, 'An operation is already running. Complete it or use /cancel first.');
+    return;
+  }
+
+  if (normalized === 'newday') {
+    await startNewday(chatId);
     return;
   }
 
@@ -4777,6 +4835,82 @@ process.once('SIGTERM', shutdown);
 //CLIENTS_API_URL=https://your-crm.example/clients
 //CLIENTS_API_TOKEN=optional-bearer-token
 //npm run import-clients ---if i want to connect api and add json files directly.
+</file>
+
+<file path="link_telegram.html">
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <style>
+    body {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      margin: 0;
+      background-color: #f0f4f8;
+      font-family: sans-serif;
+    }
+
+    /* Container controlling the vertical layout */
+    .card {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 24px;
+    }
+
+    .btn {
+      background-color: #0088cc;
+      color: white;
+      padding: 12px 24px;
+      border-radius: 6px;
+      text-decoration: none;
+      font-weight: bold;
+    }
+
+    .qr-code {
+      width: 200px;
+      height: 200px;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="card">
+    <!-- Button on Top -->
+    <a href="https://t.me/dice_apply_bot" class="btn">Chat with our Telegram Bot</a>
+    <centre>OR</centre>
+    Scan QR Code below:
+    <!-- QR Code Below -->
+    <img src="BotDice.png" alt="Telegram Bot QR Code" class="qr-code">
+  </div>
+
+</body>
+</html>
+</file>
+
+<file path="package.json">
+{
+  "scripts": {
+    "create-operator": "node scripts/create-operator.js",
+    "import-clients": "node scripts/import-clients.js",
+    "start": "node index.js",
+    "test": "node --test test/*.test.js",
+    "verify-client": "node scripts/verify-client-lookup.js",
+    "smoke-browserbase": "node scripts/smoke-browserbase.js"
+  },
+  "dependencies": {
+    "@browserbasehq/sdk": "^2.19.0",
+    "@sendgrid/mail": "^8.1.6",
+    "bcryptjs": "^3.0.3",
+    "dotenv": "^17.4.2",
+    "node-telegram-bot-api": "^2.1.0",
+    "pg": "^8.23.0",
+    "playwright": "^1.62.1",
+    "playwright-core": "^1.62.1"
+  }
+}
 </file>
 
 </files>

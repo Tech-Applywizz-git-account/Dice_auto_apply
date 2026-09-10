@@ -34,11 +34,24 @@
 
     <section id="login" class="login-panel" hidden>
       <h2>Operator sign in</h2>
-      <form id="login-form">
-        <label>Email <input type="email" id="email" required autocomplete="username"></label>
-        <label>Password <input type="password" id="password" required autocomplete="current-password"></label>
-        <button class="button" type="submit">Sign in</button>
-        <p class="error" id="login-error"></p>
+      
+      <!-- Step 1: Request OTP -->
+      <form id="request-otp-form">
+        <label>Email <input type="email" id="email" required autocomplete="username" placeholder="operator@example.com"></label>
+        <button class="button" type="submit" id="send-otp-btn">Send OTP</button>
+        <p class="error" id="email-error"></p>
+      </form>
+
+      <!-- Step 2: Verify OTP -->
+      <form id="verify-otp-form" hidden>
+        <p class="info-message" id="otp-sent-info">OTP sent to your email.</p>
+        <label>Enter 6-Digit OTP <input type="text" id="otp" required autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="123456"></label>
+        <div class="button-group">
+          <button class="button" type="submit" id="verify-otp-btn">Verify & Sign in</button>
+          <button class="button secondary" type="button" id="resend-otp-btn">Resend OTP</button>
+        </div>
+        <button class="link-button" type="button" id="change-email-btn">← Use a different email</button>
+        <p class="error" id="otp-error"></p>
       </form>
     </section>
 

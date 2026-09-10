@@ -53,9 +53,12 @@ input, select { border: 1px solid var(--line); border-radius: 4px; background: v
 .log time { color: var(--muted); }
 .log strong { font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
 .log pre { white-space: pre-wrap; margin: 4px 0 0; color: var(--muted); font: 12px/1.4 ui-monospace, monospace; }
-.login-panel { max-width: 420px; background: var(--panel); border: 1px solid var(--line); padding: 24px; }
+.login-panel { max-width: 440px; background: var(--panel); border: 1px solid var(--line); padding: 24px; }
 .login-panel form { display: grid; gap: 16px; }
-.error { color: var(--accent-dark); font: 13px Arial, sans-serif; min-height: 18px; }
+.button-group { display: flex; gap: 10px; flex-wrap: wrap; }
+.link-button { background: none; border: none; padding: 0; color: var(--green); font: 13px Arial, sans-serif; cursor: pointer; text-align: left; text-decoration: underline; }
+.info-message { color: var(--green); font: 13px/1.4 Arial, sans-serif; background: #eef6f2; border: 1px solid #cce4d8; padding: 10px; border-radius: 4px; margin-bottom: 4px; }
+.error { color: var(--accent-dark); font: 13px Arial, sans-serif; min-height: 18px; margin: 0; }
 @media (max-width: 700px) {
   .shell { width: min(100% - 20px, 1180px); padding-top: 24px; }
   .topbar { align-items: flex-start; }
