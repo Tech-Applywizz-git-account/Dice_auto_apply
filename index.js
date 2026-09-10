@@ -231,7 +231,7 @@ async function sendOTPEmail(email, otp, chatId = null) {
       subject: 'Your OTP Verification Code',
       html: `<p>Your OTP code is: <strong>${otp}</strong></p><p>This code expires in 5 minutes.</p>`,
     });
-    if (chatId) await audit(chatId, 'otp_sent', { email }).catch(() => {});
+    if (chatId) await audit(chatId, 'otp_sent', { email }).catch(() => { });
     console.log(`[OTP] Sent to ${email}`);
     return true;
   } catch (error) {
@@ -378,7 +378,7 @@ async function runLogin(chatId, credentials, isBackgroundRefresh = false) {
       console.log(`[User ${chatId}] Login browser session: ${sessionId}`);
       if (!isBackgroundRefresh) {
         await sendMessage(chatId, 'Opening remote browser for login...\n');
-          // Replay: https://www.browserbase.com/sessions/${sessionId}`);
+        // Replay: https://www.browserbase.com/sessions/${sessionId}`);
       }
     }
 
@@ -502,13 +502,13 @@ async function hasHandledJob(chatId, url) {
     return false;
   }
   if (data) {
-    await applyQueue.clearStaleClientJobs(clientId).catch(() => {});
+    await applyQueue.clearStaleClientJobs(clientId).catch(() => { });
     return true;
   }
 
   const handled = await applyQueue.hasActiveOrFinishedQueueItem(clientId, url);
   if (handled) {
-    await applyQueue.clearStaleClientJobs(clientId).catch(() => {});
+    await applyQueue.clearStaleClientJobs(clientId).catch(() => { });
   }
   return handled;
 }
@@ -621,7 +621,7 @@ async function applyToJobOnPage(page, jobName, url, chatId) {
     await submitButton.first().scrollIntoViewIfNeeded();
     await submitButton.first().click();
     await applicationPage.waitForLoadState('networkidle').catch(() => { });
-    await waitRandom(1,4, 'After Submit opens next page');
+    await waitRandom(1, 4, 'After Submit opens next page');
 
     await saveAppliedJob(chatId, url, jobName, 'completed');
     sendMessage(chatId, `✅ Application submitted successfully for:\n${jobName}`);
@@ -690,7 +690,7 @@ async function executeQueuedApply(job) {
           throw error;
         }
       } finally {
-        if (page && !page.isClosed()) await page.close().catch(() => {});
+        if (page && !page.isClosed()) await page.close().catch(() => { });
       }
     }
   } finally {
@@ -732,7 +732,7 @@ async function runJobsLoop(chatId) {
     if (state.currentPromptToken && state.currentPromptExpiresAt <= Date.now()) {
       const missedUrl = state.currentPromptUrl;
       const missedAt = state.currentPromptExpiresAt;
-      await workflowStateStore.recordDecision(chatId, state.currentPromptToken, 'missed', missedAt).catch(() => {});
+      await workflowStateStore.recordDecision(chatId, state.currentPromptToken, 'missed', missedAt).catch(() => { });
       state.currentPromptToken = null;
       state.currentPromptUrl = null;
       state.currentPromptSentAt = null;
@@ -804,8 +804,7 @@ async function runJobsLoop(chatId) {
         break;
       }
 
-      if (String(job.applywizzId || '') !== String(applyProfile.applywizz_id || '')
-        || String(job.companyEmail || '').trim().toLowerCase() !== String(applyProfile.company_email || '').trim().toLowerCase()) {
+      if (String(job.applywizzId || '') !== String(applyProfile.applywizz_id || '')) {
         continue;
       }
 
@@ -1077,7 +1076,7 @@ async function runSignInWorkflow(chatId, { greet = false } = {}) {
     }
 
     await linkTelegramChat(chatId, user.id);
-    
+
 
     await runLogin(chatId, { email, applywizz_id: user.applywizz_id, clientId: user.id });
 
@@ -1239,13 +1238,13 @@ bot.on('callback_query', async (ctx) => {
   }
 
   try {
-    await ctx.answerCallbackQuery().catch(() => {});
+    await ctx.answerCallbackQuery().catch(() => { });
     if (message) {
       await bot.api.editMessageReplyMarkup({
         chat_id: message.chat?.id || chatId,
         message_id: message.message_id,
         reply_markup: { inline_keyboard: [] },
-      }).catch(() => {});
+      }).catch(() => { });
     }
   } catch (error) {
     console.warn('[callback] failed to clear button markup:', error.message);
