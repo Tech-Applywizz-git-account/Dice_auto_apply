@@ -75,16 +75,27 @@ async function syncCAs(db) {
 
     let res;
     if (id) {
-      res = await db.query(
-        `insert into dice_ca_accounts (id, email, name, role, disabled)
-         values ($1, $2, $3, $4, false)
-         on conflict (email) do update set
-           name = excluded.name,
-           role = excluded.role,
-           disabled = false
-         returning id, email, name, role`,
-        [id, email, name, role]
+      const existing = await db.query(
+        `select id from dice_ca_accounts where id = $1 or email = $2 limit 1`,
+        [id, email]
       );
+      if (existing.rows.length > 0) {
+        const targetId = existing.rows[0].id;
+        res = await db.query(
+          `update dice_ca_accounts
+              set id = $1, email = $2, name = $3, role = $4, disabled = false
+            where id = $5
+            returning id, email, name, role`,
+          [id, email, name, role, targetId]
+        );
+      } else {
+        res = await db.query(
+          `insert into dice_ca_accounts (id, email, name, role, disabled)
+           values ($1, $2, $3, $4, false)
+           returning id, email, name, role`,
+          [id, email, name, role]
+        );
+      }
     } else {
       res = await db.query(
         `insert into dice_ca_accounts (email, name, role, disabled)
