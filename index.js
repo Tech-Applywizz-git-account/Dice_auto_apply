@@ -253,6 +253,45 @@ async function findUserByEmail(companyEmail) {
 }
 
 async function linkTelegramChat(chatId, clientId) {
+  // Check if any other telegram_chat_id was previously linked to this client
+  const { data: previousLinks, error: lookupError } = await azure
+    .from('dice_telegram_connection')
+    .select('telegram_chat_id')
+    .eq('client_id', clientId)
+    .neq('telegram_chat_id', chatId);
+
+  if (lookupError) {
+    console.error(`[User ${chatId}] Could not check previous links:`, lookupError.message);
+  }
+
+  if (Array.isArray(previousLinks) && previousLinks.length > 0) {
+    for (const link of previousLinks) {
+      const oldChatId = link.telegram_chat_id;
+      console.log(`[User ${chatId}] Client ${clientId} was previously linked to Telegram Chat ${oldChatId}. Replacing with new chat ${chatId}.`);
+
+      if (userStates.has(oldChatId)) {
+        const oldState = userStates.get(oldChatId);
+        oldState.jobRunnerActive = false;
+        if (oldState.browser) {
+          await oldState.browser.close().catch(() => {});
+        }
+      }
+    }
+
+    // Delete old links and sessions for this client (except the current chatId)
+    await azure
+      .from('dice_telegram_connection')
+      .delete()
+      .eq('client_id', clientId)
+      .neq('telegram_chat_id', chatId);
+
+    await azure
+      .from('dice_sessions')
+      .delete()
+      .eq('client_id', clientId)
+      .neq('telegram_chat_id', chatId);
+  }
+
   const { error } = await azure.from('dice_telegram_connection').upsert(
     {
       telegram_chat_id: chatId,
@@ -313,6 +352,13 @@ async function saveSession(context, chatId, email, applywizz_id, clientId) {
   if (!resolvedClientId) {
     throw new Error('Cannot save Dice session: Telegram chat is not linked to a client.');
   }
+
+  // Clear any stale dice_sessions for this client under older chat IDs
+  await azure
+    .from('dice_sessions')
+    .delete()
+    .eq('client_id', resolvedClientId)
+    .neq('telegram_chat_id', chatId);
 
   const { error } = await azure.from('dice_sessions').upsert({
     telegram_chat_id: chatId,

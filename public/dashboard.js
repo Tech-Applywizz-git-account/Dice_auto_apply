@@ -356,7 +356,7 @@ function renderCandidateDirectory() {
     const isSelected = String(state.activeCandidateId) === id;
     const name = user.full_name || user.company_email || (user.telegram_chat_id ? `User ${user.telegram_chat_id}` : `Candidate ${id.slice(0, 8)}`);
     const initials = getInitials(name);
-    const awlId = user.applywizz_id ? (user.applywizz_id.startsWith('AWL-') ? user.applywizz_id : `AWL-${user.applywizz_id}`) : (user.client_id ? `AWL-${user.client_id.slice(0, 6)}` : `AWL-${id}`);
+    const awlId = formatAwlId(user.applywizz_id, user.client_id || user.telegram_chat_id || id);
     const jobsCount = user.applications ? user.applications.length : 0;
     const isLinked = Boolean(user.telegram_chat_id);
     const statusClass = !isLinked ? 'pending' : (user.has_activity ? 'active' : 'idle');
@@ -381,7 +381,7 @@ function renderCandidateDirectory() {
   }).join('');
 }
 
-window.selectCandidate = function(candidateId) {
+window.selectCandidate = function (candidateId) {
   state.activeCandidateId = String(candidateId);
   state.selectedJobId = null; // Auto-select most recent job
   renderCandidateDirectory();
@@ -487,7 +487,7 @@ function renderCandidateWorkspace() {
   }
 }
 
-window.selectJob = function(jobId) {
+window.selectJob = function (jobId) {
   state.selectedJobId = jobId;
   renderCandidateWorkspace();
 };
@@ -565,7 +565,7 @@ function renderGlobalJobsTable() {
   tbody.innerHTML = filtered.map((app) => `
     <tr>
       <td><strong>${escapeHtml(app.client_name || app.client_email || `Chat ${app.telegram_chat_id}`)}</strong></td>
-      <td><span class="awl-pill">${escapeHtml(app.applywizz_id ? `AWL-${app.applywizz_id}` : `AWL-${app.telegram_chat_id}`)}</span></td>
+      <td><span class="awl-pill">${escapeHtml(formatAwlId(app.applywizz_id, app.telegram_chat_id))}</span></td>
       <td>${escapeHtml(app.job_name || 'Unnamed job')}</td>
       <td><span class="badge-pill green">${escapeHtml(app.status || 'Applied')}</span></td>
       <td>${formatTime(app.applied_at, state.data.timezone_name)}</td>
@@ -623,6 +623,13 @@ function getInitials(name) {
   const parts = String(name).trim().split(/\s+/);
   if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
   return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+}
+
+function formatAwlId(value, fallback) {
+  const raw = String(value || (fallback ? (String(fallback).startsWith('AWL-') ? fallback : fallback.slice(0, 8)) : '')).trim();
+  if (!raw) return 'AWL';
+  const cleaned = raw.replace(/^(awl[-_:\s]*)+/i, '');
+  return cleaned ? `AWL-${cleaned}` : raw;
 }
 
 function escapeHtml(value) {
