@@ -188,13 +188,16 @@ function hashOtp(code) {
 }
 
 async function saveOTP(chatId, email, otp) {
-  const { error } = await azure.from('dice_telegram_otps').upsert({
-    telegram_chat_id: chatId,
-    email,
-    code_hash: hashOtp(otp),
-    expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
-    created_at: new Date().toISOString(),
-  });
+  const { error } = await azure.from('dice_telegram_otps').upsert(
+    {
+      telegram_chat_id: chatId,
+      email,
+      code_hash: hashOtp(otp),
+      expires_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+      created_at: new Date().toISOString(),
+    },
+    { onConflict: 'telegram_chat_id' }
+  );
   if (error) throw new Error(`Could not save OTP: ${error.message}`);
 }
 
@@ -360,14 +363,17 @@ async function saveSession(context, chatId, email, applywizz_id, clientId) {
     .eq('client_id', resolvedClientId)
     .neq('telegram_chat_id', chatId);
 
-  const { error } = await azure.from('dice_sessions').upsert({
-    telegram_chat_id: chatId,
-    client_id: resolvedClientId,
-    email,
-    applywizz_id: applywizz_id || null,
-    storage_state: storageState,
-    updated_at: new Date().toISOString(),
-  });
+  const { error } = await azure.from('dice_sessions').upsert(
+    {
+      telegram_chat_id: chatId,
+      client_id: resolvedClientId,
+      email,
+      applywizz_id: applywizz_id || null,
+      storage_state: storageState,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: 'telegram_chat_id' }
+  );
   if (error) throw new Error(`Could not save Dice session: ${error.message}`);
 
   return {
