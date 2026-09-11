@@ -340,7 +340,8 @@ function renderCandidateDirectory() {
     const email = String(u.company_email || '').toLowerCase();
     const awl = String(u.applywizz_id || '').toLowerCase();
     const chat = String(u.telegram_chat_id || '').toLowerCase();
-    return name.includes(state.searchQuery) || email.includes(state.searchQuery) || awl.includes(state.searchQuery) || chat.includes(state.searchQuery);
+    const cid = String(u.client_id || '').toLowerCase();
+    return name.includes(state.searchQuery) || email.includes(state.searchQuery) || awl.includes(state.searchQuery) || chat.includes(state.searchQuery) || cid.includes(state.searchQuery);
   });
 
   directoryCountBadge.textContent = `${filtered.length} / ${users.length}`;
@@ -351,17 +352,18 @@ function renderCandidateDirectory() {
   }
 
   candidateList.innerHTML = filtered.map((user) => {
-    const id = String(user.telegram_chat_id);
-    const isSelected = state.activeCandidateId === id;
-    const name = user.full_name || user.company_email || `User ${user.telegram_chat_id}`;
+    const id = String(user.client_id || user.telegram_chat_id || user.id);
+    const isSelected = String(state.activeCandidateId) === id;
+    const name = user.full_name || user.company_email || (user.telegram_chat_id ? `User ${user.telegram_chat_id}` : `Candidate ${id.slice(0, 8)}`);
     const initials = getInitials(name);
-    const awlId = user.applywizz_id ? `AWL-${user.applywizz_id}` : `AWL-${id}`;
+    const awlId = user.applywizz_id ? (user.applywizz_id.startsWith('AWL-') ? user.applywizz_id : `AWL-${user.applywizz_id}`) : (user.client_id ? `AWL-${user.client_id.slice(0, 6)}` : `AWL-${id}`);
     const jobsCount = user.applications ? user.applications.length : 0;
-    const statusClass = user.has_activity ? 'active' : 'idle';
-    const statusText = user.has_activity ? `${user.audit_logs.length + user.applications.length} events` : 'No activity';
+    const isLinked = Boolean(user.telegram_chat_id);
+    const statusClass = !isLinked ? 'pending' : (user.has_activity ? 'active' : 'idle');
+    const statusText = !isLinked ? 'Not Linked' : (user.has_activity ? `${user.audit_logs.length + user.applications.length} events` : 'Idle');
 
     return `
-      <div class="candidate-card ${isSelected ? 'active' : ''}" onclick="selectCandidate('${id}')">
+      <div class="candidate-card ${isSelected ? 'active' : ''}" onclick="selectCandidate('${escapeHtml(id)}')">
         <div class="card-top">
           <div class="avatar-awl">
             <span class="avatar">${initials}</span>
@@ -379,8 +381,8 @@ function renderCandidateDirectory() {
   }).join('');
 }
 
-window.selectCandidate = function(chatId) {
-  state.activeCandidateId = chatId;
+window.selectCandidate = function(candidateId) {
+  state.activeCandidateId = String(candidateId);
   state.selectedJobId = null; // Auto-select most recent job
   renderCandidateDirectory();
   renderCandidateWorkspace();
@@ -393,7 +395,11 @@ function renderCandidateWorkspace() {
     return;
   }
 
-  const user = state.data.users.find((u) => String(u.telegram_chat_id) === String(state.activeCandidateId));
+  const user = state.data.users.find((u) =>
+    String(u.client_id || u.telegram_chat_id || u.id) === String(state.activeCandidateId) ||
+    (u.client_id && String(u.client_id) === String(state.activeCandidateId)) ||
+    (u.telegram_chat_id && String(u.telegram_chat_id) === String(state.activeCandidateId))
+  );
   if (!user) {
     emptyWorkspace.hidden = false;
     candidateWorkspace.hidden = true;
@@ -469,8 +475,15 @@ function renderCandidateWorkspace() {
       </div>
     `;
     startTimers();
+  } else if (!user.telegram_chat_id) {
+    sessionMetricsGrid.innerHTML = `
+      <div class="metric-box" style="grid-column: 1 / -1; text-align: left; padding: 12px; background: #fffbeb; border: 1px dashed #f59e0b; border-radius: 6px;">
+        <span class="status-badge pending" style="display:inline-block; margin-bottom: 6px;">Pending Telegram Connection</span>
+        <p class="muted" style="margin: 0; font-size: 13px; color: #78350f;">This candidate is synced with Applywizz, but hasn't linked their Telegram account yet. Once they authenticate via Telegram, the bot will begin scanning and applying for jobs.</p>
+      </div>
+    `;
   } else {
-    sessionMetricsGrid.innerHTML = '<p class="muted">No active Telegram workflow session recorded for this date.</p>';
+    sessionMetricsGrid.innerHTML = '<p class="muted">Telegram linked. No active workflow session recorded for this date.</p>';
   }
 }
 
@@ -481,7 +494,11 @@ window.selectJob = function(jobId) {
 
 function renderCandidateJobsSubTab() {
   if (!state.activeCandidateId || !state.data) return;
-  const user = state.data.users.find((u) => String(u.telegram_chat_id) === String(state.activeCandidateId));
+  const user = state.data.users.find((u) =>
+    String(u.client_id || u.telegram_chat_id || u.id) === String(state.activeCandidateId) ||
+    (u.client_id && String(u.client_id) === String(state.activeCandidateId)) ||
+    (u.telegram_chat_id && String(u.telegram_chat_id) === String(state.activeCandidateId))
+  );
   if (!user) return;
 
   const summary = user.prompts_summary || { total: 0, accepted: 0, rejected: 0, skipped: 0 };

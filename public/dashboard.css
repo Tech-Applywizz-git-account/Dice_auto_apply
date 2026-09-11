@@ -367,6 +367,7 @@ input[type="date"], select, input[type="search"], input[type="email"], input[typ
 
 .status-badge.active { background: var(--pill-green-bg); color: var(--pill-green-txt); border-color: #10b981; }
 .status-badge.idle { background: var(--pill-gray-bg); color: var(--pill-gray-txt); border-color: #cbd5e1; }
+.status-badge.pending { background: #fef3c7; color: #92400e; border-color: #f59e0b; }
 
 .cand-name {
   font-weight: 700;
