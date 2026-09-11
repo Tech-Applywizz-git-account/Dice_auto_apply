@@ -46,11 +46,17 @@ async function syncCAs(db) {
   const payload = await fetchJson(caApiUrl);
   const rawList = Array.isArray(payload)
     ? payload
-    : Array.isArray(payload.data)
-      ? payload.data
-      : Array.isArray(payload.records)
-        ? payload.records
-        : [];
+    : Array.isArray(payload.users)
+      ? payload.users
+      : Array.isArray(payload.data)
+        ? payload.data
+        : Array.isArray(payload.records)
+          ? payload.records
+          : Array.isArray(payload.cas)
+            ? payload.cas
+            : Array.isArray(payload.career_associates)
+              ? payload.career_associates
+              : [];
 
   if (rawList.length === 0) {
     console.warn('[sync] No CA records returned from CA_DETAILS_API.');
@@ -148,13 +154,14 @@ async function syncMappings(db, azure, targetDate, cas) {
       if (!applywizzId) continue;
 
       try {
-        // Attempt fast update on existing client in clients_additional_info
+        const clientId = record.client_id || record.id || null;
         const updateRes = await db.query(
           `update clients_additional_info
               set career_associate_id = $1
             where applywizz_id = $2
+               or ($3::uuid is not null and id = $3::uuid)
             returning id`,
-          [caId, applywizzId]
+          [caId, applywizzId, clientId]
         );
 
         if (updateRes.rowCount > 0) {

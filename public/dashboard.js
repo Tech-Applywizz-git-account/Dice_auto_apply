@@ -156,7 +156,7 @@ if (syncMappingsBtn) {
       const res = await fetch('/api/sync-daily', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ date: dateInput.value }),
+        body: JSON.stringify({}),
       });
       const data = await res.json();
       if (!res.ok || !data.ok) {
