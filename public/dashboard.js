@@ -19,6 +19,7 @@ const statusText = document.querySelector('#status');
 const navDashboardTab = document.querySelector('#nav-dashboard-tab');
 const navStatsTab = document.querySelector('#nav-stats-tab');
 const refreshBtn = document.querySelector('#refresh-btn');
+const syncMappingsBtn = document.querySelector('#sync-mappings-btn');
 const logoutBtn = document.querySelector('#logout');
 
 const loginPanel = document.querySelector('#login');
@@ -143,6 +144,48 @@ logoutBtn.addEventListener('click', async () => {
   await fetch('/api/auth/logout', { method: 'POST' });
   showLogin();
 });
+
+if (syncMappingsBtn) {
+  syncMappingsBtn.addEventListener('click', async () => {
+    const originalText = syncMappingsBtn.textContent;
+    syncMappingsBtn.disabled = true;
+    syncMappingsBtn.textContent = '⏳ Syncing...';
+    statusText.textContent = 'Syncing CA-client mappings...';
+
+    try {
+      const res = await fetch('/api/sync-daily', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ date: dateInput.value }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || 'Sync failed');
+      }
+
+      syncMappingsBtn.textContent = '✓ Synced!';
+      syncMappingsBtn.style.background = '#d1fae5';
+      statusText.textContent = `Synced ${data.total_mappings || 0} mappings (${data.clients_updated || 0} updated)`;
+      await loadDashboard();
+
+      setTimeout(() => {
+        syncMappingsBtn.textContent = originalText;
+        syncMappingsBtn.style.background = '';
+        syncMappingsBtn.disabled = false;
+      }, 3000);
+    } catch (err) {
+      console.error('Sync failed:', err);
+      syncMappingsBtn.textContent = '❌ Failed';
+      syncMappingsBtn.style.background = '#fee2e2';
+      statusText.textContent = `Sync error: ${err.message}`;
+      setTimeout(() => {
+        syncMappingsBtn.textContent = originalText;
+        syncMappingsBtn.style.background = '';
+        syncMappingsBtn.disabled = false;
+      }, 3000);
+    }
+  });
+}
 
 // Step 1: Request OTP
 requestOtpForm.addEventListener('submit', async (event) => {

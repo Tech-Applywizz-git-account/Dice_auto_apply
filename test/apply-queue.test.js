@@ -5,7 +5,7 @@ const { createApplyQueue } = require('../lib/apply-queue');
 test('hasActiveClientJob detects queued or running work for the same client', async () => {
   const supabase = {
     from(table) {
-      assert.equal(table, 'apply_queue');
+      assert.equal(table, 'dice_apply_queue');
       return {
         select() {
           return {

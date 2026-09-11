@@ -3,6 +3,7 @@
     "create-operator": "node scripts/create-operator.js",
     "import-operators": "node scripts/import-operators.js",
     "import-clients": "node scripts/import-clients.js",
+    "sync-daily": "node scripts/sync-daily-pipeline.js",
     "start": "node index.js",
     "test": "node --test test/*.test.js",
     "verify-client": "node scripts/verify-client-lookup.js",
