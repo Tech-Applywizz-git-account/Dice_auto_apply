@@ -2,7 +2,6 @@ require('dotenv').config();
 
 const crypto = require('crypto');
 const { Bot } = require('node-telegram-bot-api');
-const sgMail = require('@sendgrid/mail');
 const { createPool, createServiceClient } = require('./lib/azure');
 const { createDashboardServer } = require('./lib/dashboard-server');
 const { fillCurrentStep, isVisibleEnabled, loadApplyProfile } = require('./lib/dice-apply-questions');
@@ -10,12 +9,11 @@ const { openBrowser, closeBrowser, useBrowserbase, maxConcurrent } = require('./
 const { createApplyQueue } = require('./lib/apply-queue');
 const { startApplyWorkers } = require('./lib/apply-worker');
 const { createWorkflowStateStore } = require('./lib/workflow-state');
+const { sendEmail } = require('./lib/mailer');
 
 const botToken = process.env.BOT_TOKEN;
 const allowedChatId = process.env.CHAT_ID ? Number(process.env.CHAT_ID) : null;
 const dicePassword = process.env.DICE_PASSWORD;
-const sendGridApiKey = process.env.SENDGRID_API_KEY;
-const senderEmail = process.env.SENDER_EMAIL || 'noreply@applywizz.com'; // Placeholder
 
 if (!botToken) {
   throw new Error('BOT_TOKEN must be set in the environment.');
@@ -29,8 +27,6 @@ const dashboardServer = createDashboardServer({ db: createPool() });
 const applyQueue = createApplyQueue(azure);
 const workflowStateStore = createWorkflowStateStore(azure);
 let applyWorkerController = null;
-
-sgMail.setApiKey(sendGridApiKey);
 const loginUrl = 'https://www.dice.com/dashboard/login';
 const SESSION_MS = 9 * 60 * 60 * 1000;
 const LINK_CUTOFF_MS = (8 * 60 + 32) * 60 * 1000;
@@ -143,6 +139,12 @@ async function hydrateWorkflowState(chatId) {
   state.currentPromptSentAt = row.current_prompt_sent_at ? Date.parse(row.current_prompt_sent_at) : null;
   state.currentPromptExpiresAt = row.current_prompt_expires_at ? Date.parse(row.current_prompt_expires_at) : null;
   state.newdayRequestedAt = row.newday_requested_at ? Date.parse(row.newday_requested_at) : null;
+  state.lastDecision = row.last_decision || null;
+
+  if (row.last_decision === 'expired' || (state.sessionDeadline && Date.now() >= state.sessionDeadline)) {
+    state.completionNotified = true;
+  }
+
   return state;
 }
 
@@ -219,23 +221,17 @@ async function deleteOTP(chatId) {
 }
 
 async function sendOTPEmail(email, otp, chatId = null) {
-  if (!sendGridApiKey) {
-    console.warn('SendGrid API key not configured. OTP not sent via email.');
-    return false;
-  }
-
   try {
-    await sgMail.send({
+    const res = await sendEmail({
       to: email,
-      from: senderEmail,
       subject: 'Your OTP Verification Code',
+      text: `Your OTP code is: ${otp}\nThis code expires in 5 minutes.`,
       html: `<p>Your OTP code is: <strong>${otp}</strong></p><p>This code expires in 5 minutes.</p>`,
     });
-    if (chatId) await audit(chatId, 'otp_sent', { email }).catch(() => { });
-    console.log(`[OTP] Sent to ${email}`);
-    return true;
+    if (chatId && res.ok) await audit(chatId, 'otp_sent', { email }).catch(() => { });
+    return res.ok;
   } catch (error) {
-    console.error(`[OTP] Failed to send to ${email}:`, error.message);
+    console.error(`[OTP] Failed to send email to ${email}:`, error.message);
     return false;
   }
 }
@@ -435,37 +431,43 @@ async function refreshLogin(chatId) {
 }
 
 // === JOBS & APPLICATIONS ===
-async function readJobUrls(scrapedAfter = null, applywizzId = null) {
-  let query = azure
-    .from('dice_scraped_jobs')
-    .select('url, title, company, applywizz_id, company_email, scraped_at');
+async function readJobUrls(clientId, applywizzId, scrapedAfter = null) {
+  if (!applywizzId || !clientId) return [];
 
-  if (applywizzId) {
-    query = query.eq('applywizz_id', applywizzId);
-  }
+  const pool = createPool();
+  const scrapedAfterIso = scrapedAfter ? new Date(scrapedAfter).toISOString() : null;
 
-  if (scrapedAfter) {
-    query = query.gte('scraped_at', new Date(scrapedAfter).toISOString());
-  }
+  try {
+    const result = await pool.query(
+      `SELECT j.id, j.url, j.title, j.company, j.applywizz_id, j.company_email, j.scraped_at
+       FROM dice_scraped_jobs j
+       WHERE j.applywizz_id = $1
+         AND ($2::timestamptz IS NULL OR j.scraped_at >= $2::timestamptz)
+         AND NOT EXISTS (
+           SELECT 1 FROM dice_applied_jobs a
+           WHERE a.client_id = $3 AND a.url = j.url
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM dice_apply_queue q
+           WHERE q.client_id = $3 AND q.url = j.url
+         )
+       ORDER BY j.scraped_at DESC`,
+      [applywizzId, scrapedAfterIso, clientId]
+    );
 
-  const { data, error } = await query;
-
-  if (error) {
-    console.error('Failed to load jobs:', error.message);
+    return (result.rows || []).map((job) => ({
+      id: job.id,
+      url: job.url,
+      title: job.title,
+      company: job.company,
+      applywizzId: job.applywizz_id,
+      companyEmail: job.company_email,
+      scrapedAt: job.scraped_at,
+    }));
+  } catch (error) {
+    console.error('Failed to load unhandled jobs:', error.message);
     return [];
   }
-  return (data || []).filter((job) => {
-    if (!scrapedAfter) return true;
-    const scrapedAt = Date.parse(job.scraped_at || '');
-    return Number.isFinite(scrapedAt) && scrapedAt >= scrapedAfter;
-  }).map((job) => ({
-    url: job.url,
-    title: job.title,
-    company: job.company,
-    applywizzId: job.applywizz_id,
-    companyEmail: job.company_email,
-    scrapedAt: job.scraped_at,
-  }));
 }
 
 async function saveAppliedJob(chatId, url, jobName, status) {
@@ -534,6 +536,66 @@ async function getJobName(page) {
   const jobTitle = (await page.locator('h1').first().textContent() || '').trim();
   const company = (await page.locator('[data-wa-click="djv-job-company-profile-click"]').first().textContent() || '').trim();
   return company ? `${jobTitle} (${company})` : jobTitle;
+}
+
+async function prevalidateJob(chatId, job) {
+  const storageState = await readDiceStorageState(chatId);
+  if (!storageState) {
+    console.warn(`[User ${chatId}] No Dice storageState found for pre-flight check.`);
+    return { ok: true, jobName: job.title || 'Unknown Job' };
+  }
+
+  let browser = null;
+  try {
+    browser = await openBrowser({ storageState });
+    const page = await browser.newPage();
+    await page.goto(job.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForLoadState('networkidle').catch(() => {});
+
+    const jobName = await getJobName(page).catch(() => job.title || 'Unknown Job');
+
+    if (page.url().includes('/login')) {
+      console.warn(`[User ${chatId}] Session expired during pre-flight check for ${job.url}`);
+      return { ok: false, reason: 'session_expired', jobName };
+    }
+
+    const applyButton = page.getByTestId('apply-button');
+    const applyCount = await applyButton.count().catch(() => 0);
+    if (applyCount === 0) {
+      return { ok: false, reason: 'no_apply_button', jobName };
+    }
+
+    const isVisible = await applyButton.first().isVisible().catch(() => false);
+    if (!isVisible) {
+      return { ok: false, reason: 'no_apply_button', jobName };
+    }
+
+    const popupPromise = page.context()
+      .waitForEvent('page', { timeout: 4000 })
+      .catch(() => null);
+
+    await applyButton.first().click().catch(() => {});
+
+    const applicationPage = await Promise.race([
+      popupPromise,
+      new Promise((resolve) => setTimeout(() => resolve(null), 4000)),
+    ]) || page;
+
+    await applicationPage.waitForLoadState('domcontentloaded').catch(() => {});
+
+    if (!applicationPage.url().includes('dice.com')) {
+      return { ok: false, reason: 'external', jobName };
+    }
+
+    return { ok: true, jobName };
+  } catch (error) {
+    console.warn(`[User ${chatId}] Pre-flight validation error for ${job.url}:`, error.message);
+    return { ok: true, jobName: job.title || 'Unknown Job' };
+  } finally {
+    if (browser) {
+      await closeBrowser(browser).catch(() => {});
+    }
+  }
 }
 
 async function applyToJobOnPage(page, jobName, url, chatId) {
@@ -727,10 +789,11 @@ async function runJobsLoop(chatId) {
     }
 
     if (state.sessionDeadline && Date.now() >= state.sessionDeadline) {
-      if (!state.completionNotified) {
+      if (!state.completionNotified && state.lastDecision !== 'expired') {
         state.completionNotified = true;
         await sendMessage(chatId, 'The 9-hour job application window has ended.');
       }
+      state.lastDecision = 'expired';
       await persistWorkflowState(chatId, state, {
         last_decision: 'expired',
         last_decision_at: new Date().toISOString(),
@@ -763,7 +826,7 @@ async function runJobsLoop(chatId) {
     const scrapedAfter = state.newdayRequestedAt
       ? state.newdayRequestedAt - NEWDAY_LOOKBACK_MS
       : null;
-    const jobs = await readJobUrls(scrapedAfter, applyProfile.applywizz_id);
+    const jobs = await readJobUrls(clientId, applyProfile.applywizz_id, scrapedAfter);
     const urls = jobs.map((job) => job.url);
     const hasNewUrl = urls.some((url) => !state.knownJobUrls.has(url));
     state.knownJobUrls = new Set(urls);
@@ -781,7 +844,7 @@ async function runJobsLoop(chatId) {
     let offeredAny = false;
     let unhandledUrlFound = false;
 
-    console.log(`[User ${chatId}] Processing ${jobs.length} jobs. Profile AWL ID: '${applyProfile.applywizz_id}'`);
+    console.log(`[User ${chatId}] Processing ${jobs.length} unhandled jobs. Profile AWL ID: '${applyProfile.applywizz_id}'`);
     for (const job of jobs) {
       const { url } = job;
       if (!state.jobRunnerActive || state.runGeneration !== runGeneration) {
@@ -808,10 +871,11 @@ async function runJobsLoop(chatId) {
       const linkCutoff = state.sessionStartedAt && state.sessionStartedAt + LINK_CUTOFF_MS;
       const promptStillOpen = state.currentPromptToken && state.currentPromptExpiresAt > Date.now();
       if (linkCutoff && Date.now() >= linkCutoff && !promptStillOpen) {
-        if (!state.completionNotified) {
+        if (!state.completionNotified && state.lastDecision !== 'expired') {
           state.completionNotified = true;
           await sendMessage(chatId, 'The 9-hour job application window has ended.');
         }
+        state.lastDecision = 'expired';
         await persistWorkflowState(chatId, state, { last_decision: 'expired', last_decision_at: new Date().toISOString() });
         state.jobRunnerActive = false;
         break;
@@ -820,6 +884,19 @@ async function runJobsLoop(chatId) {
       if (String(job.applywizzId || '') !== String(applyProfile.applywizz_id || '')) {
         console.log(`[User ${chatId}] Skipping ${url}: applywizz_id mismatch. Job: '${job.applywizzId}', Profile: '${applyProfile.applywizz_id}'`);
         continue;
+      }
+
+      const isResumingPrompt = state.currentPromptToken && state.currentPromptUrl === url;
+
+      // Pre-flight check: Verify Apply button & internal Dice application before sending prompt
+      if (!isResumingPrompt) {
+        console.log(`[User ${chatId}] Running pre-flight check on ${url}...`);
+        const precheck = await prevalidateJob(chatId, job);
+        if (!precheck.ok) {
+          console.log(`[User ${chatId}] Pre-flight check failed for ${url}: ${precheck.reason}. Skipping silently.`);
+          await saveAppliedJob(chatId, url, precheck.jobName || job.title || 'Unknown Job', precheck.reason);
+          continue;
+        }
       }
 
       if (!state.sessionStartedAt) {
@@ -836,7 +913,6 @@ async function runJobsLoop(chatId) {
 
       unhandledUrlFound = true;
 
-      const isResumingPrompt = state.currentPromptToken && state.currentPromptUrl === url;
       console.log(`[User ${chatId}] ${isResumingPrompt ? 'Resuming' : 'Prompting for'} job: ${url}`);
       offeredAny = true;
       const promptToken = isResumingPrompt ? state.currentPromptToken : crypto.randomUUID();
@@ -1082,7 +1158,7 @@ async function runSignInWorkflow(chatId, { greet = false } = {}) {
     }
 
     await deleteOTP(chatId);
-    await sendMessage(chatId, 'Email verified! /n your application process will start shortly');
+    await sendMessage(chatId, 'Email verified!\nYour application process will start shortly.');
 
     const user = await findUserByEmail(email);
     if (!user) {
@@ -1221,13 +1297,8 @@ async function handleCommand(chatId, text) {
     return;
   }
 
-  const linkedClientId = await getClientIdForChat(chatId);
-  if (!linkedClientId) {
-    await runSignInWorkflow(chatId, { greet: true });
-    return;
-  }
-
-  await sendMessage(chatId, 'You are already linked. Send /start if you need to sign in again.');
+  // Ignore any other random text when not in an active conversation
+  return;
 }
 
 bot.on('message', (ctx) => {
@@ -1329,6 +1400,15 @@ bot.on('callback_query', async (ctx) => {
   for (const chatId of users) {
     const activeSession = await readActiveSession(chatId);
     if (activeSession) {
+      const workflowRow = await workflowStateStore.get(chatId).catch(() => null);
+      const deadline = workflowRow?.session_deadline ? Date.parse(workflowRow.session_deadline) : null;
+      const isExpired = workflowRow?.last_decision === 'expired' || (deadline && Date.now() >= deadline);
+
+      if (isExpired) {
+        console.log(`[Startup] User ${chatId} 9-hour session has already ended. Waiting for /newday.`);
+        continue;
+      }
+
       console.log(`[Startup] Auto-starting background job scanner for user ${chatId}`);
       const state = stateFor(chatId);
       state.jobRunnerActive = true;
