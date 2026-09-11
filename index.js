@@ -591,7 +591,8 @@ async function getJobName(page) {
 }
 
 async function prevalidateJob(chatId, job) {
-  const storageState = await readDiceStorageState(chatId);
+  const activeSession = await readActiveSession(chatId);
+  const storageState = activeSession?.storageState || null;
   if (!storageState) {
     console.warn(`[User ${chatId}] No Dice storageState found for pre-flight check.`);
     return { ok: true, jobName: job.title || 'Unknown Job' };
