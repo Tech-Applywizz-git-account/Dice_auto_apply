@@ -292,6 +292,22 @@ function render() {
   // Update Top Header Telemetry & Operator Name
   document.querySelector('#candidates-count').textContent = state.data.total_candidates ?? state.data.users.length;
   document.querySelector('#jobs-count').textContent = state.data.total_jobs ?? 0;
+
+  if (state.data.operator) {
+    state.operatorName = state.data.operator.name || state.data.operator.email || state.operatorName;
+    state.operatorRole = state.data.operator.role || 'operator';
+  }
+  const opTag = document.querySelector('.op-tag');
+  if (opTag) {
+    opTag.textContent = state.operatorRole === 'admin' ? 'ADMIN' : 'CA';
+    if (state.operatorRole === 'admin') {
+      opTag.style.background = '#1d4ed8';
+      opTag.style.color = '#ffffff';
+    } else {
+      opTag.style.background = '';
+      opTag.style.color = '';
+    }
+  }
   document.querySelector('#operator-name').textContent = state.operatorName || 'Operator';
 
   updateMasterTabUI();

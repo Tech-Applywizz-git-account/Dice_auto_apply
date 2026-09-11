@@ -598,10 +598,10 @@ async function prevalidateJob(chatId, job) {
     return { ok: true, jobName: job.title || 'Unknown Job' };
   }
 
-  let browser = null;
+  let handle = null;
   try {
-    browser = await openBrowser({ storageState });
-    const page = await browser.newPage();
+    handle = await openBrowser({ storageState });
+    const { page } = handle;
     await page.goto(job.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await page.waitForLoadState('networkidle').catch(() => {});
 
@@ -645,8 +645,8 @@ async function prevalidateJob(chatId, job) {
     console.warn(`[User ${chatId}] Pre-flight validation error for ${job.url}:`, error.message);
     return { ok: true, jobName: job.title || 'Unknown Job' };
   } finally {
-    if (browser) {
-      await closeBrowser(browser).catch(() => {});
+    if (handle) {
+      await closeBrowser(handle).catch(() => {});
     }
   }
 }
