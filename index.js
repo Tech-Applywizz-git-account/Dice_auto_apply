@@ -1215,6 +1215,7 @@ async function runSignInWorkflow(chatId, { greet = false } = {}) {
 
 
     await runLogin(chatId, { email, applywizz_id: user.applywizz_id, clientId: user.id });
+    await sendMessage(chatId, 'Dice login successful.');
 
     state.workflowActive = false;
     if (!state.jobRunnerActive) {
