@@ -375,8 +375,12 @@ function renderCandidateDirectory() {
     const awlId = formatAwlId(user.applywizz_id, user.client_id || user.telegram_chat_id || id);
     const jobsCount = user.applications ? user.applications.length : 0;
     const isLinked = Boolean(user.telegram_chat_id);
-    const statusClass = !isLinked ? 'pending' : (user.has_activity ? 'active' : 'idle');
-    const statusText = !isLinked ? 'Not Linked' : (user.has_activity ? `${user.audit_logs.length + user.applications.length} events` : 'Idle');
+    const isLive = isLinked && Boolean(
+      user.has_activity ||
+      (user.session?.session_deadline && new Date(user.session.session_deadline).getTime() > Date.now())
+    );
+    const statusClass = !isLinked ? 'pending' : (isLive ? 'active' : 'idle');
+    const statusText = !isLinked ? 'Not Linked' : (isLive ? (user.has_activity ? `${user.audit_logs.length + user.applications.length} events` : 'Active') : 'Idle');
 
     return `
       <div class="candidate-card ${isSelected ? 'active' : ''}" onclick="selectCandidate('${escapeHtml(id)}')">
