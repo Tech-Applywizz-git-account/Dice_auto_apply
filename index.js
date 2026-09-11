@@ -672,8 +672,9 @@ async function applyToJobOnPage(page, jobName, url, chatId) {
   if (applicationPage.url().includes('/login')) throw sessionExpiredError();
 
   if (!applicationPage.url().includes('dice.com')) {
+    console.warn(`[User ${chatId}] Skipped ${jobName}: Redirected to external site.`);
     await saveAppliedJob(chatId, url, jobName, 'external');
-    sendMessage(chatId, `⚠️ Skipped ${jobName}: Redirected to external site.`);
+    sendMessage(chatId, 'application failed, reviewing.');
     return false;
   }
 
@@ -696,8 +697,9 @@ async function applyToJobOnPage(page, jobName, url, chatId) {
         submitButton.waitFor({ state: 'visible', timeout: 10000 })
       ]);
     } catch (e) {
+      console.warn(`[User ${chatId}] Skipped ${jobName}: Missing Next/Submit (likely an extra question we could not fill).`);
       await saveAppliedJob(chatId, url, jobName, 'external_or_failed');
-      sendMessage(chatId, `⚠️ Skipped ${jobName}: Missing Next/Submit (likely an extra question we could not fill).`);
+      sendMessage(chatId, 'application failed, reviewing.');
       return false;
     }
 
@@ -711,14 +713,16 @@ async function applyToJobOnPage(page, jobName, url, chatId) {
     if (nextVisible) {
       const filled = await fillCurrentStep(applicationPage, applyProfile);
       if (!filled.ok) {
+        console.warn(`[User ${chatId}] Skipped ${jobName}: ${filled.reason || 'Could not answer an application question.'}`);
         await saveAppliedJob(chatId, url, jobName, 'external_or_failed');
-        sendMessage(chatId, `⚠️ Skipped ${jobName}: ${filled.reason || 'Could not answer an application question.'}`);
+        sendMessage(chatId, 'application failed, reviewing.');
         return false;
       }
 
       if (!await isVisibleEnabled(nextButton)) {
+        console.warn(`[User ${chatId}] Skipped ${jobName}: Next stayed disabled after filling questions.`);
         await saveAppliedJob(chatId, url, jobName, 'external_or_failed');
-        sendMessage(chatId, `⚠️ Skipped ${jobName}: Next stayed disabled after filling questions.`);
+        sendMessage(chatId, 'application failed, reviewing.');
         return false;
       }
 
@@ -746,8 +750,9 @@ async function applyToJobOnPage(page, jobName, url, chatId) {
     return true;
   }
 
+  console.warn(`[User ${chatId}] Skipped ${jobName}: Could not complete application.`);
   await saveAppliedJob(chatId, url, jobName, 'failed');
-  sendMessage(chatId, `⚠️ Skipped ${jobName}: Could not complete application.`);
+  sendMessage(chatId, 'application failed, reviewing.');
   return false;
 }
 
@@ -756,7 +761,7 @@ async function executeQueuedApply(job) {
   const chatId = Number(job.telegram_chat_id);
   const url = job.url;
 
-  await sendMessage(chatId, `Starting application from queue:\n${url}`);
+  await sendMessage(chatId, 'applying to the job');
 
   let activeSession = await readActiveSession(chatId);
   if (!activeSession) {
@@ -803,8 +808,9 @@ async function executeQueuedApply(job) {
           });
           retryAfterLogin = true;
         } else {
+          console.error(`[User ${chatId}] Failed to apply to ${url}:`, error.message);
           await saveAppliedJob(chatId, url, 'Failed', 'failed');
-          sendMessage(chatId, `Failed to apply: ${error.message}`);
+          sendMessage(chatId, 'application failed, reviewing.');
           throw error;
         }
       } finally {
@@ -988,7 +994,12 @@ async function runJobsLoop(chatId) {
         });
       }
 
-      await sendMessageWithButtons(chatId, `New Job Found:\n${url}\n\nDo you want to apply?`, [
+      let promptText = 'New Job Found:\n';
+      if (job.title) promptText += `Title: ${job.title}\n`;
+      if (job.company) promptText += `Company: ${job.company}\n`;
+      promptText += `Link: ${url}\n\nDo you want to apply?`;
+
+      await sendMessageWithButtons(chatId, promptText, [
         [{ text: '✅ Yes', callback_data: `job_yes_${promptToken}` }],
         [{ text: '❌ No', callback_data: `job_no_${promptToken}` }],
       ]);
@@ -1032,7 +1043,7 @@ async function runJobsLoop(chatId) {
 
       if (!response.decision) {
         await saveAppliedJob(chatId, url, 'Skipped by user', 'rejected');
-        await sendMessage(chatId, 'Job rejected. Moving to next.');
+        await sendMessage(chatId, 'response noted-no');
         state.consecutiveNoCount += 1;
         if (state.consecutiveNoCount >= 3) {
           state.consecutiveNoCount = 0;
@@ -1050,6 +1061,7 @@ async function runJobsLoop(chatId) {
       }
 
       state.consecutiveNoCount = 0;
+      await sendMessage(chatId, 'response noted-yes');
 
       const availableAt = Date.now() + randomMinutes(15, 20);
       console.log(`[User ${chatId}] Yes accepted; automation available at ${new Date(availableAt).toISOString()}`);
@@ -1096,30 +1108,13 @@ async function runJobsLoop(chatId) {
           break;
         }
 
-        const position = created ? await applyQueue.getQueuePosition(row.id) : null;
-        const queuedCount = await applyQueue.countQueuedAhead();
-        if (created && position) {
-          await sendMessage(
-            chatId,
-            `Queued for apply (position ~${position}, ~${queuedCount || position} waiting).\nWorkers will pick this up when a browser slot is free.`
-          );
-          state.nextScanAt = Math.min(state.sessionDeadline, clickAt + NEXT_LINK_DELAY_MS);
-          await audit(chatId, 'next_link_scheduled', {
-            reason: 'yes',
-            scheduledAt: new Date(state.nextScanAt).toISOString(),
-            delayMs: Math.max(0, state.nextScanAt - Date.now()),
-          });
-          break;
-        } else {
-          await sendMessage(chatId, 'Already in the apply queue. Waiting for a worker...');
-          state.nextScanAt = Math.min(state.sessionDeadline, clickAt + NEXT_LINK_DELAY_MS);
-          await audit(chatId, 'next_link_scheduled', {
-            reason: 'yes_existing_queue',
-            scheduledAt: new Date(state.nextScanAt).toISOString(),
-            delayMs: Math.max(0, state.nextScanAt - Date.now()),
-          });
-          break;
-        }
+        state.nextScanAt = Math.min(state.sessionDeadline, clickAt + NEXT_LINK_DELAY_MS);
+        await audit(chatId, 'next_link_scheduled', {
+          reason: created ? 'yes' : 'yes_existing_queue',
+          scheduledAt: new Date(state.nextScanAt).toISOString(),
+          delayMs: Math.max(0, state.nextScanAt - Date.now()),
+        });
+        break;
       } catch (error) {
         console.error(`[User ${chatId}] Enqueue failed:`, error.message);
         await sendMessage(chatId, `Could not queue apply: ${error.message}`);
