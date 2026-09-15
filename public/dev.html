@@ -88,6 +88,9 @@
             <input type="search" id="stream-search" placeholder="Filter by event (e.g. prompt, yes, error), candidate email, or chat ID..." />
           </div>
           <div class="filter-group">
+            <select id="stream-user-filter" title="Filter logs by specific candidate">
+              <option value="all">👥 All Users (Combined)</option>
+            </select>
             <select id="stream-event-filter">
               <option value="all">All Event Types</option>
               <option value="job_prompt_sent">Job Prompt Sent</option>
@@ -175,6 +178,7 @@
                 <th>Next Scan Schedule</th>
                 <th>Last Decision</th>
                 <th>Current Prompt</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody id="sessions-table-body">
