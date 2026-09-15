@@ -247,12 +247,14 @@ async function runSyncDaily(options = {}) {
   const db = options.db || createPool();
   const azure = options.azure || createServiceClient();
   const targetDate = options.date || getYesterdayDate();
+  const targetCA = options.targetCA || null;
 
-  console.log(`=== Starting Daily Sync Pipeline for date: ${targetDate} ===`);
+  const modeStr = targetCA ? `Scoped to CA: ${targetCA.email}` : 'Global (All CAs)';
+  console.log(`=== Starting Daily Sync Pipeline [${modeStr}] for date: ${targetDate} ===`);
   const startTime = Date.now();
 
   try {
-    const cas = await syncCAs(db);
+    const cas = targetCA ? [targetCA] : await syncCAs(db);
     const mappingStats = await syncMappings(db, azure, targetDate, cas);
 
     const durationSeconds = ((Date.now() - startTime) / 1000).toFixed(2);
@@ -260,6 +262,8 @@ async function runSyncDaily(options = {}) {
 
     return {
       ok: true,
+      scoped: Boolean(targetCA),
+      ca_email: targetCA?.email || null,
       duration_seconds: durationSeconds,
       date: targetDate,
       cas_synced: cas.length,

@@ -159,13 +159,27 @@ if (syncMappingsBtn) {
         body: JSON.stringify({}),
       });
       const data = await res.json();
+
+      if (res.status === 429) {
+        syncMappingsBtn.textContent = '⏳ Cooldown Active';
+        syncMappingsBtn.style.background = '#fef3c7';
+        statusText.textContent = data.error || 'Cooldown active. Please wait before syncing again.';
+        setTimeout(() => {
+          syncMappingsBtn.textContent = originalText;
+          syncMappingsBtn.style.background = '';
+          syncMappingsBtn.disabled = false;
+        }, 3500);
+        return;
+      }
+
       if (!res.ok || !data.ok) {
         throw new Error(data.error || 'Sync failed');
       }
 
       syncMappingsBtn.textContent = '✓ Synced!';
       syncMappingsBtn.style.background = '#d1fae5';
-      statusText.textContent = `Synced ${data.total_mappings || 0} mappings (${data.clients_updated || 0} updated)`;
+      const scopeLabel = data.scoped ? ` (scoped to ${data.ca_email || 'your account'})` : '';
+      statusText.textContent = `Synced ${data.total_mappings || 0} mappings (${data.clients_updated || 0} updated)${scopeLabel}`;
       await loadDashboard();
 
       setTimeout(() => {
