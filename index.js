@@ -481,18 +481,18 @@ async function refreshLogin(chatId) {
 }
 
 // === JOBS & APPLICATIONS ===
-async function readJobUrls(clientId, applywizzId, scrapedAfter = null) {
+async function readJobUrls(clientId, applywizzId, scrapedAfter = Date.now() - NEWDAY_LOOKBACK_MS) {
   if (!applywizzId || !clientId) return [];
 
   const pool = createPool();
-  const scrapedAfterIso = scrapedAfter ? new Date(scrapedAfter).toISOString() : null;
+  const scrapedAfterIso = new Date(scrapedAfter || (Date.now() - NEWDAY_LOOKBACK_MS)).toISOString();
 
   try {
     const result = await pool.query(
       `SELECT j.id, j.url, j.title, j.company, j.applywizz_id, j.company_email, j.scraped_at
        FROM dice_scraped_jobs j
        WHERE j.applywizz_id = $1
-         AND ($2::timestamptz IS NULL OR j.scraped_at >= $2::timestamptz)
+         AND j.scraped_at >= $2::timestamptz
          AND NOT EXISTS (
            SELECT 1 FROM dice_applied_jobs a
            WHERE a.client_id = $3 AND a.url = j.url
@@ -501,7 +501,8 @@ async function readJobUrls(clientId, applywizzId, scrapedAfter = null) {
            SELECT 1 FROM dice_apply_queue q
            WHERE q.client_id = $3 AND q.url = j.url
          )
-       ORDER BY j.scraped_at DESC`,
+       ORDER BY j.scraped_at DESC
+       LIMIT 50`,
       [applywizzId, scrapedAfterIso, clientId]
     );
 
@@ -925,9 +926,7 @@ async function runJobsLoop(chatId) {
     const clientId = await getClientIdForChat(chatId);
     const applyProfile = clientId ? await loadApplyProfile(azure, clientId) : {};
 
-    const scrapedAfter = state.newdayRequestedAt
-      ? state.newdayRequestedAt - NEWDAY_LOOKBACK_MS
-      : null;
+    const scrapedAfter = (state.newdayRequestedAt || Date.now()) - NEWDAY_LOOKBACK_MS;
     const jobs = await readJobUrls(clientId, applyProfile.applywizz_id, scrapedAfter);
     const urls = jobs.map((job) => job.url);
     const hasNewUrl = urls.some((url) => !state.knownJobUrls.has(url));
