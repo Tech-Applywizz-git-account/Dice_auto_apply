@@ -34,11 +34,6 @@ const LINK_CUTOFF_MS = (8 * 60 + 32) * 60 * 1000;
 const DECISION_TIMEOUT_MS = 15 * 60 * 1000;
 const NEXT_LINK_DELAY_MS = 28 * 60 * 1000;
 const NEWDAY_LOOKBACK_MS = 24 * 60 * 60 * 1000;
-
-if (!botToken) {
-  throw new Error('BOT_TOKEN must be set in the environment.');
-}
-
 const bot = new Bot(botToken);
 const userStates = new Map();
 
@@ -104,6 +99,7 @@ function waitForDecision(chatId, timeoutMs = DECISION_TIMEOUT_MS) {
       if (state.decisionTimer) clearTimeout(state.decisionTimer);
       state.decisionTimer = null;
       state.decisionResolver = null;
+      state.currentPromptToken = null;
       resolve(result);
     };
 
@@ -1065,6 +1061,12 @@ async function runJobsLoop(chatId) {
       const response = await waitForDecision(chatId, decisionWaitMs);
       if (state.runGeneration !== runGeneration) break;
       const clickAt = response.clickedAt || Date.now();
+
+      state.currentPromptToken = null;
+      state.currentPromptUrl = null;
+      state.currentPromptSentAt = null;
+      state.currentPromptExpiresAt = null;
+
       await audit(chatId, response.decision === null ? 'job_missed' : response.decision ? 'job_yes' : 'job_no', {
         url,
         clickedAt: new Date(clickAt).toISOString(),
@@ -1077,10 +1079,6 @@ async function runJobsLoop(chatId) {
         last_decision: response.decision === null ? 'missed' : response.decision ? 'yes' : 'no',
         last_decision_at: new Date(clickAt).toISOString(),
       });
-      state.currentPromptToken = null;
-      state.currentPromptUrl = null;
-      state.currentPromptSentAt = null;
-      state.currentPromptExpiresAt = null;
 
       if (response.decision === null) {
         await saveAppliedJob(chatId, url, 'Job missed', 'missed');
