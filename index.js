@@ -886,6 +886,8 @@ async function runJobsLoop(chatId) {
   state.jobRunnerActive = true;
   console.log(`[User ${chatId}] Job loop started.`);
 
+  let consecutiveEmptyPolls = 0;
+
   while (state.jobRunnerActive && state.runGeneration === runGeneration) {
     if (state.nextScanAt > Date.now()) {
       await waitUntil(state.nextScanAt);
@@ -934,11 +936,14 @@ async function runJobsLoop(chatId) {
     state.knownJobUrls = new Set(urls);
 
     if (state.completionNotified && !hasNewUrl) {
-      await new Promise((r) => setTimeout(r, 10000));
+      consecutiveEmptyPolls++;
+      const delayMs = Math.min(10000 * Math.pow(2, Math.max(0, consecutiveEmptyPolls - 1)), 300000);
+      await new Promise((r) => setTimeout(r, delayMs));
       continue;
     }
 
     if (hasNewUrl) {
+      consecutiveEmptyPolls = 0;
       state.completionNotified = false;
       console.log(`[User ${chatId}] New job URL detected; resuming scanner.`);
     }
@@ -946,7 +951,9 @@ async function runJobsLoop(chatId) {
     let offeredAny = false;
     let unhandledUrlFound = false;
 
-    console.log(`[User ${chatId}] Processing ${jobs.length} unhandled jobs. Profile AWL ID: '${applyProfile.applywizz_id}'`);
+    if (jobs.length > 0 || consecutiveEmptyPolls === 0) {
+      console.log(`[User ${chatId}] Processing ${jobs.length} unhandled jobs. Profile AWL ID: '${applyProfile.applywizz_id}'`);
+    }
     for (const job of jobs) {
       const { url } = job;
       if (!state.jobRunnerActive || state.runGeneration !== runGeneration) {
@@ -1196,7 +1203,13 @@ async function runJobsLoop(chatId) {
     }
 
     if (!offeredAny && state.jobRunnerActive) {
-      await new Promise((r) => setTimeout(r, 10000));
+      if (!state.completionNotified || hasNewUrl) {
+        consecutiveEmptyPolls++;
+      }
+      const delayMs = Math.min(10000 * Math.pow(2, Math.max(0, consecutiveEmptyPolls - 1)), 300000);
+      await new Promise((r) => setTimeout(r, delayMs));
+    } else if (offeredAny) {
+      consecutiveEmptyPolls = 0;
     }
   }
 
