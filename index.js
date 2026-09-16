@@ -10,6 +10,7 @@ const { createApplyQueue } = require('./lib/apply-queue');
 const { startApplyWorkers } = require('./lib/apply-worker');
 const { createWorkflowStateStore } = require('./lib/workflow-state');
 const { sendEmail } = require('./lib/mailer');
+const { prewarmNLP } = require('./lib/local-nlp');
 
 const botToken = process.env.BOT_TOKEN;
 const allowedChatId = process.env.CHAT_ID ? Number(process.env.CHAT_ID) : null;
@@ -521,7 +522,7 @@ async function readJobUrls(clientId, applywizzId, scrapedAfter = Date.now() - NE
   }
 }
 
-async function saveAppliedJob(chatId, url, jobName, status) {
+async function saveAppliedJob(chatId, url, jobName, status, reason = null) {
   const clientId = await getClientIdForChat(chatId);
   if (!clientId) {
     console.error(`[User ${chatId}] Cannot save application: no linked client.`);
@@ -537,6 +538,7 @@ async function saveAppliedJob(chatId, url, jobName, status) {
       url,
       job_name: jobName || 'Unknown Job',
       status,
+      reason,
       applied_at: new Date().toISOString(),
     },
     { onConflict: 'client_id,url' }
@@ -546,7 +548,7 @@ async function saveAppliedJob(chatId, url, jobName, status) {
     console.error(`[User ${chatId}] Failed to save application:`, error.message);
     return;
   }
-  console.log(`[User ${chatId}] Saved job decision: ${status} for ${url}`);
+  console.log(`[User ${chatId}] Saved job decision: ${status}${reason ? ` (${reason})` : ''} for ${url}`);
 }
 
 async function hasHandledJob(chatId, url) {
@@ -679,7 +681,7 @@ async function applyToJobOnPage(page, jobName, url, chatId) {
 
   if (!applicationPage.url().includes('dice.com')) {
     console.warn(`[User ${chatId}] Skipped ${jobName}: Redirected to external site.`);
-    await saveAppliedJob(chatId, url, jobName, 'external');
+    await saveAppliedJob(chatId, url, jobName, 'failed', 'external_redirect');
     sendMessage(chatId, 'application failed, reviewing.');
     return false;
   }
@@ -740,7 +742,7 @@ async function applyToJobOnPage(page, jobName, url, chatId) {
       ]);
     } catch (e) {
       console.warn(`[User ${chatId}] Skipped ${jobName}: Missing Next/Submit (likely an extra question we could not fill).`);
-      await saveAppliedJob(chatId, url, jobName, 'external_or_failed');
+      await saveAppliedJob(chatId, url, jobName, 'failed', 'missing_next_or_submit');
       sendMessage(chatId, 'application failed, reviewing.');
       return false;
     }
@@ -761,18 +763,18 @@ async function applyToJobOnPage(page, jobName, url, chatId) {
       if (!filled.ok) {
         if (filled.reason === 'SKIPPED_BY_USER' || filled.reason?.includes("didn't give response")) {
           console.log(`[User ${chatId}] Job skipped: ${filled.reason}`);
-          await saveAppliedJob(chatId, url, jobName, 'skipped');
+          await saveAppliedJob(chatId, url, jobName, 'skipped', filled.reason);
           return false;
         }
         console.warn(`[User ${chatId}] Skipped ${jobName}: ${filled.reason || 'Could not answer an application question.'}`);
-        await saveAppliedJob(chatId, url, jobName, 'external_or_failed');
+        await saveAppliedJob(chatId, url, jobName, 'failed', filled.reason || 'unanswered_question');
         sendMessage(chatId, 'application failed, reviewing.');
         return false;
       }
 
       if (!await isVisibleEnabled(nextButton)) {
         console.warn(`[User ${chatId}] Skipped ${jobName}: Next stayed disabled after filling questions.`);
-        await saveAppliedJob(chatId, url, jobName, 'external_or_failed');
+        await saveAppliedJob(chatId, url, jobName, 'failed', 'next_button_disabled');
         sendMessage(chatId, 'application failed, reviewing.');
         return false;
       }
@@ -802,7 +804,7 @@ async function applyToJobOnPage(page, jobName, url, chatId) {
   }
 
   console.warn(`[User ${chatId}] Skipped ${jobName}: Could not complete application.`);
-  await saveAppliedJob(chatId, url, jobName, 'failed');
+  await saveAppliedJob(chatId, url, jobName, 'failed', 'submit_button_not_clickable');
   sendMessage(chatId, 'application failed, reviewing.');
   return false;
 }
@@ -860,7 +862,7 @@ async function executeQueuedApply(job) {
           retryAfterLogin = true;
         } else {
           console.error(`[User ${chatId}] Failed to apply to ${url}:`, error.message);
-          await saveAppliedJob(chatId, url, 'Failed', 'failed');
+          await saveAppliedJob(chatId, url, 'Failed', 'failed', error.message);
           sendMessage(chatId, 'application failed, reviewing.');
           throw error;
         }
@@ -918,7 +920,7 @@ async function runJobsLoop(chatId) {
         last_decision: 'missed',
         last_decision_at: new Date(missedAt).toISOString(),
       });
-      await saveAppliedJob(chatId, missedUrl, 'Job missed', 'missed');
+      await saveAppliedJob(chatId, missedUrl, 'Job missed', 'missed', 'timeout');
       await sendMessage(chatId, 'Job missed');
       continue;
     }
@@ -995,7 +997,7 @@ async function runJobsLoop(chatId) {
         const precheck = await prevalidateJob(chatId, job);
         if (!precheck.ok) {
           console.log(`[User ${chatId}] Pre-flight check failed for ${url}: ${precheck.reason}. Skipping silently.`);
-          await saveAppliedJob(chatId, url, precheck.jobName || job.title || 'Unknown Job', precheck.reason);
+          await saveAppliedJob(chatId, url, precheck.jobName || job.title || 'Unknown Job', 'failed', precheck.reason);
           continue;
         }
       }
@@ -1080,7 +1082,7 @@ async function runJobsLoop(chatId) {
       });
 
       if (response.decision === null) {
-        await saveAppliedJob(chatId, url, 'Job missed', 'missed');
+        await saveAppliedJob(chatId, url, 'Job missed', 'missed', 'timeout');
         await sendMessage(chatId, 'Job missed');
         state.nextScanAt = Math.min(state.sessionDeadline, promptSentAt + DECISION_TIMEOUT_MS + NEXT_LINK_DELAY_MS);
         await persistWorkflowState(chatId, state);
@@ -1093,7 +1095,7 @@ async function runJobsLoop(chatId) {
       }
 
       if (!response.decision) {
-        await saveAppliedJob(chatId, url, 'Skipped by user', 'rejected');
+        await saveAppliedJob(chatId, url, 'Skipped by user', 'rejected', 'user_clicked_no');
         await sendMessage(chatId, 'response noted-no');
         state.consecutiveNoCount += 1;
         if (state.consecutiveNoCount >= 3) {
@@ -1521,6 +1523,8 @@ bot.on('callback_query', async (ctx) => {
     pollMs: 2000,
   });
   console.log(`[Init] Apply queue workers: ${maxConcurrent}`);
+
+  prewarmNLP().catch(() => {});
 
   const users = await getAllRegisteredUsers();
   console.log(`[Startup] Found ${users.length} registered user(s).`);
