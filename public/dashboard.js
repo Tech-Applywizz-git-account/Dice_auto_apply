@@ -392,21 +392,21 @@ function renderCandidateDirectory() {
   // Group filtered users by CA
   const groups = {};
   for (const user of filtered) {
-    const caId = user.career_associate_id || 'Unassigned';
-    if (!groups[caId]) groups[caId] = [];
-    groups[caId].push(user);
+    const caName = user.ca_name || user.career_associate_id || 'Unassigned';
+    if (!groups[caName]) groups[caName] = [];
+    groups[caName].push(user);
   }
 
   // Sort CA names alphabetically
   const sortedCaNames = Object.keys(groups).sort((a, b) => a.localeCompare(b));
 
   let html = '';
-  for (const caId of sortedCaNames) {
+  for (const caName of sortedCaNames) {
     if (state.data.operator && state.data.operator.role === 'admin') {
-      html += `<div class="ca-sidebar-header">${escapeHtml(caId)}</div>`;
+      html += `<div class="ca-sidebar-header">${escapeHtml(caName)}</div>`;
     }
     
-    html += groups[caId].map((user) => {
+    html += groups[caName].map((user) => {
       const id = String(user.client_id || user.telegram_chat_id || user.id);
       const isSelected = String(state.activeCandidateId) === id;
       const name = user.full_name || user.company_email || (user.telegram_chat_id ? `User ${user.telegram_chat_id}` : `Candidate ${id.slice(0, 8)}`);
@@ -724,7 +724,7 @@ function renderCaStats() {
         <table class="data-table">
           <thead>
             <tr>
-              <th>CA Email / ID</th>
+              <th>CA Name</th>
               <th>Total Clients</th>
               <th>Active Sessions</th>
               <th>Applied Today</th>
