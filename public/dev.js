@@ -481,7 +481,8 @@ function renderErrorsTable() {
     const user = String(j.full_name || j.company_email || j.telegram_chat_id || '').toLowerCase();
     const title = String(j.job_name || '').toLowerCase();
     const status = String(j.status || '').toLowerCase();
-    return user.includes(state.filters.errorsSearch) || title.includes(state.filters.errorsSearch) || status.includes(state.filters.errorsSearch);
+    const reason = String(j.reason || '').toLowerCase();
+    return user.includes(state.filters.errorsSearch) || title.includes(state.filters.errorsSearch) || status.includes(state.filters.errorsSearch) || reason.includes(state.filters.errorsSearch);
   });
 
   if (filtered.length === 0) {
@@ -498,7 +499,10 @@ function renderErrorsTable() {
         <td style="font-family:var(--font-mono); font-size:11px;">${timeStr}</td>
         <td><strong>${escapeHtml(user)}</strong></td>
         <td>${escapeHtml(j.job_name || 'Unnamed job')}</td>
-        <td><span class="badge badge-red">${escapeHtml(j.status)}</span></td>
+        <td>
+          <span class="badge badge-red">${escapeHtml(j.status)}</span>
+          ${j.reason ? `<div style="font-size: 11px; margin-top: 4px; color: var(--text-dim);">${escapeHtml(j.reason)}</div>` : ''}
+        </td>
         <td><a href="${escapeHtml(j.url || '#')}" target="_blank" rel="noopener" style="color:var(--accent-blue)">Inspect Link ↗</a></td>
       </tr>
     `;
