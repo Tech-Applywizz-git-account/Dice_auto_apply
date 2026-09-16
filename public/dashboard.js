@@ -333,6 +333,7 @@ function render() {
   renderCandidateDirectory();
   renderCandidateWorkspace();
   renderGlobalStats();
+  renderCaStats();
 }
 
 function updateMasterTabUI() {
@@ -347,6 +348,7 @@ function updateMasterTabUI() {
     dashboardViewContainer.hidden = true;
     statsViewContainer.hidden = false;
     renderGlobalStats();
+    renderCaStats();
   }
 }
 
@@ -364,6 +366,7 @@ function updateCandidateSubTabUI() {
     renderCandidateJobsSubTab();
   }
 }
+
 
 function renderCandidateDirectory() {
   if (!state.data || !state.data.users) return;
@@ -386,22 +389,39 @@ function renderCandidateDirectory() {
     return;
   }
 
-  candidateList.innerHTML = filtered.map((user) => {
-    const id = String(user.client_id || user.telegram_chat_id || user.id);
-    const isSelected = String(state.activeCandidateId) === id;
-    const name = user.full_name || user.company_email || (user.telegram_chat_id ? `User ${user.telegram_chat_id}` : `Candidate ${id.slice(0, 8)}`);
-    const initials = getInitials(name);
-    const awlId = formatAwlId(user.applywizz_id, user.client_id || user.telegram_chat_id || id);
-    const jobsCount = user.applications ? user.applications.length : 0;
-    const isLinked = Boolean(user.telegram_chat_id);
-    const isLive = isLinked && Boolean(
-      user.has_activity ||
-      (user.session?.session_deadline && new Date(user.session.session_deadline).getTime() > Date.now())
-    );
-    const statusClass = !isLinked ? 'pending' : (isLive ? 'active' : 'idle');
-    const statusText = !isLinked ? 'Not Linked' : (isLive ? (user.has_activity ? `${user.audit_logs.length + user.applications.length} events` : 'Active') : 'Idle');
+  // Group filtered users by CA
+  const groups = {};
+  for (const user of filtered) {
+    const caId = user.career_associate_id || 'Unassigned';
+    if (!groups[caId]) groups[caId] = [];
+    groups[caId].push(user);
+  }
 
-    return `
+  // Sort CA names alphabetically
+  const sortedCaNames = Object.keys(groups).sort((a, b) => a.localeCompare(b));
+
+  let html = '';
+  for (const caId of sortedCaNames) {
+    if (state.data.operator && state.data.operator.role === 'admin') {
+      html += `<div class="ca-sidebar-header">${escapeHtml(caId)}</div>`;
+    }
+    
+    html += groups[caId].map((user) => {
+      const id = String(user.client_id || user.telegram_chat_id || user.id);
+      const isSelected = String(state.activeCandidateId) === id;
+      const name = user.full_name || user.company_email || (user.telegram_chat_id ? `User ${user.telegram_chat_id}` : `Candidate ${id.slice(0, 8)}`);
+      const initials = getInitials(name);
+      const awlId = formatAwlId(user.applywizz_id, user.client_id || user.telegram_chat_id || id);
+      const jobsCount = user.applications ? user.applications.length : 0;
+      const isLinked = Boolean(user.telegram_chat_id);
+      const isLive = isLinked && Boolean(
+        user.has_activity ||
+        (user.session?.session_deadline && new Date(user.session.session_deadline).getTime() > Date.now())
+      );
+      const statusClass = !isLinked ? 'pending' : (isLive ? 'active' : 'idle');
+      const statusText = !isLinked ? 'Not Linked' : (isLive ? (user.has_activity ? `${user.audit_logs.length + user.applications.length} events` : 'Active') : 'Idle');
+
+      return `
       <div class="candidate-card ${isSelected ? 'active' : ''}" onclick="selectCandidate('${escapeHtml(id)}')">
         <div class="card-top">
           <div class="avatar-awl">
@@ -416,8 +436,11 @@ function renderCandidateDirectory() {
           <span class="jobs-count-pill">${jobsCount} ${jobsCount === 1 ? 'Job' : 'Jobs'}</span>
         </div>
       </div>
-    `;
-  }).join('');
+      `;
+    }).join('');
+  }
+
+  candidateList.innerHTML = html;
 }
 
 window.selectCandidate = function (candidateId) {
@@ -676,3 +699,57 @@ function escapeHtml(value) {
 }
 
 loadDashboard();
+
+function renderCaStats() {
+  const container = document.querySelector('#ca-stats-container');
+  if (!container) return;
+  
+  if (!state.data || !state.data.operator || state.data.operator.role !== 'admin' || !state.data.ca_stats) {
+    container.innerHTML = '';
+    return;
+  }
+  
+  const stats = state.data.ca_stats;
+  if (!stats.length) {
+    container.innerHTML = '<p class="muted">No CA stats available.</p>';
+    return;
+  }
+  
+  let html = `
+    <section class="panel-card margin-top">
+      <div class="card-header-bar">
+        <h3>Career Associate Directory</h3>
+      </div>
+      <div class="table-responsive">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>CA Email / ID</th>
+              <th>Total Clients</th>
+              <th>Active Sessions</th>
+              <th>Applied Today</th>
+            </tr>
+          </thead>
+          <tbody>
+  `;
+  
+  for (const ca of stats) {
+    html += `
+      <tr>
+        <td><strong>${escapeHtml(ca.ca_name || 'Unassigned')}</strong></td>
+        <td>${ca.total_clients || 0}</td>
+        <td>${ca.active_sessions || 0}</td>
+        <td><span class="badge-pill blue">${ca.applied_today || 0}</span></td>
+      </tr>
+    `;
+  }
+  
+  html += `
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+  
+  container.innerHTML = html;
+}
