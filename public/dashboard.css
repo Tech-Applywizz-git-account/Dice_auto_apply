@@ -77,6 +77,14 @@ body {
   gap: 10px;
 }
 
+.brand-logo-img {
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  object-fit: cover;
+  border: var(--border-light);
+}
+
 .brand-logo {
   display: flex;
   align-items: center;

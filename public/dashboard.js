@@ -61,7 +61,7 @@ dateInput.value = [today.getFullYear(), String(today.getMonth() + 1).padStart(2,
 // Event Listeners
 dateInput.addEventListener('change', loadDashboard);
 timezoneInput.addEventListener('change', loadDashboard);
-refreshBtn.addEventListener('click', loadDashboard);
+refreshBtn.addEventListener('click', () => window.location.reload());
 
 const copyLinkBtn = document.querySelector('#copy-link-btn');
 const showQrBtn = document.querySelector('#show-qr-btn');
@@ -379,7 +379,8 @@ function renderCandidateDirectory() {
     const awl = String(u.applywizz_id || '').toLowerCase();
     const chat = String(u.telegram_chat_id || '').toLowerCase();
     const cid = String(u.client_id || '').toLowerCase();
-    return name.includes(state.searchQuery) || email.includes(state.searchQuery) || awl.includes(state.searchQuery) || chat.includes(state.searchQuery) || cid.includes(state.searchQuery);
+    const ca = String(u.ca_name || u.career_associate_id || '').toLowerCase();
+    return name.includes(state.searchQuery) || email.includes(state.searchQuery) || awl.includes(state.searchQuery) || chat.includes(state.searchQuery) || cid.includes(state.searchQuery) || ca.includes(state.searchQuery);
   });
 
   directoryCountBadge.textContent = `${filtered.length} / ${users.length}`;
@@ -419,7 +420,7 @@ function renderCandidateDirectory() {
         (user.session?.session_deadline && new Date(user.session.session_deadline).getTime() > Date.now())
       );
       const statusClass = !isLinked ? 'pending' : (isLive ? 'active' : 'idle');
-      const statusText = !isLinked ? 'Not Linked' : (isLive ? (user.has_activity ? `${user.audit_logs.length + user.applications.length} events` : 'Active') : 'Idle');
+      const statusText = !isLinked ? 'Not Linked' : (isLive ? 'Linked' : 'Idle');
 
       return `
       <div class="candidate-card ${isSelected ? 'active' : ''}" onclick="selectCandidate('${escapeHtml(id)}')">
@@ -521,7 +522,7 @@ function renderCandidateWorkspace() {
     sessionMetricsGrid.innerHTML = `
       <div class="metric-box">
         <strong>${formatTime(session.session_started_at, state.data.timezone_name)}</strong>
-        <span>1-hr / Window Start</span>
+        <span>9-hr Window start</span>
       </div>
       <div class="metric-box">
         <strong>${formatTime(session.session_deadline, state.data.timezone_name)}</strong>
@@ -727,7 +728,7 @@ function renderCaStats() {
               <th>CA Name</th>
               <th>Total Clients</th>
               <th>Active Sessions</th>
-              <th>Applied Today</th>
+              <th>Applications Prompted</th>
             </tr>
           </thead>
           <tbody>

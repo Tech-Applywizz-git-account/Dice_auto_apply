@@ -81,6 +81,14 @@ body {
   gap: 10px;
 }
 
+.brand-logo-img {
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  object-fit: cover;
+  border: var(--border);
+}
+
 .dev-brand-badge {
   background: var(--accent-purple);
   color: #ffffff;
