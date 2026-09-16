@@ -10,7 +10,6 @@ const { createApplyQueue } = require('./lib/apply-queue');
 const { startApplyWorkers } = require('./lib/apply-worker');
 const { createWorkflowStateStore } = require('./lib/workflow-state');
 const { sendEmail } = require('./lib/mailer');
-const { prewarmNLP } = require('./lib/local-nlp');
 
 const botToken = process.env.BOT_TOKEN;
 const allowedChatId = process.env.CHAT_ID ? Number(process.env.CHAT_ID) : null;
@@ -1523,8 +1522,6 @@ bot.on('callback_query', async (ctx) => {
     pollMs: 2000,
   });
   console.log(`[Init] Apply queue workers: ${maxConcurrent}`);
-
-  prewarmNLP().catch(() => {});
 
   const users = await getAllRegisteredUsers();
   console.log(`[Startup] Found ${users.length} registered user(s).`);
