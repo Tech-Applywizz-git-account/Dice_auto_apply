@@ -281,7 +281,7 @@ async function deriveManagerLinks(db, cas) {
       const res = await db.query(
         `select career_associate_manager_id
            from clients_additional_info
-          where (career_associate_id = $1 or lower(career_associate_id) = lower($2))
+          where (career_associate_id::text = $1 or lower(career_associate_id::text) = lower($2))
             and career_associate_manager_id is not null
           limit 1`,
         [String(ca.id), String(ca.email || '')]
